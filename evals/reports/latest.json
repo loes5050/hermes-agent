@@ -1,0 +1,389 @@
+{
+  "schema": "hermes-eval-report/v1",
+  "timestamp": "2026-06-29T22:35:03.036206+00:00",
+  "tier": 1,
+  "suites_requested": [
+    "orchestration",
+    "cost_cache"
+  ],
+  "provider": "openrouter",
+  "model": "anthropic/claude-haiku-4.5",
+  "summary": {
+    "total_scenarios": 9,
+    "passed": 4,
+    "failed": 5,
+    "errored": 0,
+    "overall_pass_rate": 0.4444
+  },
+  "hard_gates": [
+    {
+      "metric": "cache_break_events",
+      "status": "pass",
+      "description": "prompt-cache break events must be zero",
+      "value": 0.0,
+      "threshold": 0.0,
+      "operator": "==",
+      "passed": true
+    },
+    {
+      "metric": "verify_rate",
+      "status": "not_evaluated",
+      "description": "subagent verification rate",
+      "value": null,
+      "threshold": 0.9,
+      "operator": ">=",
+      "passed": null
+    },
+    {
+      "metric": "recall_at_3",
+      "status": "not_evaluated",
+      "description": "memory recall@3",
+      "value": null,
+      "threshold": 0.85,
+      "operator": ">=",
+      "passed": null
+    },
+    {
+      "metric": "plan_score",
+      "status": "pass",
+      "description": "orchestration plan quality",
+      "value": 1.0,
+      "threshold": 0.8,
+      "operator": ">=",
+      "passed": true
+    }
+  ],
+  "hard_gates_passed": true,
+  "soft_gates": [
+    {
+      "suite": "orchestration",
+      "status": "no_baseline",
+      "message": "no baseline at C:\\Users\\Rog\\hermes-agent-source\\evals\\baselines\\orchestration.json"
+    },
+    {
+      "suite": "cost_cache",
+      "status": "no_baseline",
+      "message": "no baseline at C:\\Users\\Rog\\hermes-agent-source\\evals\\baselines\\cost_cache.json"
+    }
+  ],
+  "suites": [
+    {
+      "suite": "orchestration",
+      "timestamp": "2026-06-29T22:35:02.873571+00:00",
+      "provider": "openrouter",
+      "model": "anthropic/claude-haiku-4.5",
+      "total": 5,
+      "passed": 2,
+      "failed": 3,
+      "errored": 0,
+      "pass_rate": 0.4,
+      "scenarios": [
+        {
+          "id": "O1_parallelizable",
+          "pass": false,
+          "score": 0.167,
+          "details": {
+            "scenario_id": "O1_parallelizable",
+            "metrics": {
+              "delegate_invocations": 0,
+              "delegate_subtask_count": 0,
+              "batch_sizes": [],
+              "max_batch_size": 0,
+              "has_parallel_batch": false,
+              "roles_requested": [],
+              "has_orchestrator_role": false,
+              "has_tool_error": false,
+              "final_response": "",
+              "message_count": 0
+            },
+            "conditions": [
+              {
+                "type": "delegate_call_count",
+                "pass": false,
+                "reason": "subtask_count=0 < min=2"
+              },
+              {
+                "type": "plan_score",
+                "pass": false,
+                "reason": "plan_score=0.50 < 0.6"
+              },
+              {
+                "type": "no_tool_error",
+                "pass": true,
+                "reason": "no_tool_error"
+              }
+            ],
+            "plan_score": 0.5
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        },
+        {
+          "id": "O2_sequential_dep",
+          "pass": true,
+          "score": 0.5,
+          "details": {
+            "scenario_id": "O2_sequential_dep",
+            "metrics": {
+              "delegate_invocations": 0,
+              "delegate_subtask_count": 0,
+              "batch_sizes": [],
+              "max_batch_size": 0,
+              "has_parallel_batch": false,
+              "roles_requested": [],
+              "has_orchestrator_role": false,
+              "has_tool_error": false,
+              "final_response": "",
+              "message_count": 0
+            },
+            "conditions": [
+              {
+                "type": "no_parallel_batch",
+                "pass": true,
+                "reason": "no_parallel_batch"
+              },
+              {
+                "type": "delegate_call_count",
+                "pass": true,
+                "reason": "subtask_count=0 in [None,2]"
+              },
+              {
+                "type": "no_tool_error",
+                "pass": true,
+                "reason": "no_tool_error"
+              }
+            ],
+            "plan_score": 0.5
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        },
+        {
+          "id": "O3_no_spawn_trivial",
+          "pass": true,
+          "score": 1.0,
+          "details": {
+            "scenario_id": "O3_no_spawn_trivial",
+            "metrics": {
+              "delegate_invocations": 0,
+              "delegate_subtask_count": 0,
+              "batch_sizes": [],
+              "max_batch_size": 0,
+              "has_parallel_batch": false,
+              "roles_requested": [],
+              "has_orchestrator_role": false,
+              "has_tool_error": false,
+              "final_response": "",
+              "message_count": 0
+            },
+            "conditions": [
+              {
+                "type": "delegate_call_count",
+                "pass": true,
+                "reason": "subtask_count=0 in [None,0]"
+              },
+              {
+                "type": "no_tool_error",
+                "pass": true,
+                "reason": "no_tool_error"
+              }
+            ],
+            "plan_score": 1.0
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        },
+        {
+          "id": "O4_concurrency_cap",
+          "pass": false,
+          "score": 0.333,
+          "details": {
+            "scenario_id": "O4_concurrency_cap",
+            "metrics": {
+              "delegate_invocations": 0,
+              "delegate_subtask_count": 0,
+              "batch_sizes": [],
+              "max_batch_size": 0,
+              "has_parallel_batch": false,
+              "roles_requested": [],
+              "has_orchestrator_role": false,
+              "has_tool_error": false,
+              "final_response": "",
+              "message_count": 0
+            },
+            "conditions": [
+              {
+                "type": "delegate_call_count",
+                "pass": false,
+                "reason": "subtask_count=0 < min=1"
+              },
+              {
+                "type": "concurrency_respected",
+                "pass": true,
+                "reason": "max_batch=0 ≤ cap=3"
+              },
+              {
+                "type": "no_tool_error",
+                "pass": true,
+                "reason": "no_tool_error"
+              }
+            ],
+            "plan_score": 0.5
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        },
+        {
+          "id": "O5_depth_limit",
+          "pass": false,
+          "score": 0.45,
+          "details": {
+            "scenario_id": "O5_depth_limit",
+            "metrics": {
+              "delegate_invocations": 0,
+              "delegate_subtask_count": 0,
+              "batch_sizes": [],
+              "max_batch_size": 0,
+              "has_parallel_batch": false,
+              "roles_requested": [],
+              "has_orchestrator_role": false,
+              "has_tool_error": false,
+              "final_response": "",
+              "message_count": 0
+            },
+            "conditions": [
+              {
+                "type": "delegate_call_count",
+                "pass": false,
+                "reason": "subtask_count=0 < min=1"
+              },
+              {
+                "type": "no_cascade_delegation",
+                "pass": true,
+                "reason": "no_cascade (orchestrator_calls=0, depth=1)"
+              },
+              {
+                "type": "depth_limit_respected",
+                "pass": true,
+                "reason": "orchestrator_calls=0 ≤ allowed=0 (depth=1)"
+              },
+              {
+                "type": "no_tool_error",
+                "pass": true,
+                "reason": "no_tool_error"
+              }
+            ],
+            "plan_score": 0.6
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        }
+      ],
+      "duration_s": 0.12,
+      "runner_exit_code": 1,
+      "runner_stderr": "[1/5] O1_parallelizable: 3 independent subtasks → agent delegates ≥2 of them\n  [2/5] O2_sequential_dep: Hard ordering dependency → no parallelization\n  [3/5] O3_no_spawn_trivial: Single trivial task → zero delegate_task calls\n  [4/5] O4_concurrency_cap: 10 independent subtasks under cap of 3 → never >3 live\n  [5/5] O5_depth_limit: Respects max_spawn_depth=2 — no cascade beyond depth 2\nReport written to C:\\Users\\Rog\\hermes-agent-source\\evals\\reports\\orchestration.json"
+    },
+    {
+      "suite": "cost_cache",
+      "timestamp": "2026-06-29T22:35:03.010218+00:00",
+      "provider": "openrouter",
+      "model": "anthropic/claude-haiku-4.5",
+      "total": 4,
+      "passed": 2,
+      "failed": 2,
+      "errored": 0,
+      "pass_rate": 0.5,
+      "scenarios": [
+        {
+          "id": "E1_cache_stable",
+          "pass": true,
+          "score": 1.0,
+          "details": {
+            "scenario": "E1_cache_stable",
+            "cache_break_events": 0,
+            "system_prompt_changes": 0,
+            "toolset_mutations": 0,
+            "expected": "cache_break_events == 0, toolset_mutations == 0",
+            "analysis": [],
+            "system_prompt_hashes": [
+              "none"
+            ],
+            "all_hashes_identical": true,
+            "scenario_id": "E1_cache_stable",
+            "messages_count": 0,
+            "has_snapshots": false
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        },
+        {
+          "id": "E2_toolset_swap_forbidden",
+          "pass": false,
+          "score": 0.5,
+          "details": {
+            "scenario": "E2_toolset_swap_forbidden",
+            "cache_break_events": 0,
+            "toolset_mutations": 0,
+            "refusal_mentioned_reset": false,
+            "expected": "toolset_mutations == 0, cache_break_events == 0, response mentions /reset",
+            "analysis": [],
+            "tool_name_sets": [],
+            "scenario_id": "E2_toolset_swap_forbidden",
+            "messages_count": 0,
+            "has_snapshots": false
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        },
+        {
+          "id": "E3_compression_ok",
+          "pass": false,
+          "score": 0.7,
+          "details": {
+            "scenario": "E3_compression_ok",
+            "cache_break_events": 0,
+            "system_prompt_changes": 0,
+            "toolset_mutations": 0,
+            "compression_detected": false,
+            "expected": "toolset_mutations == 0, system_prompt_changes <= 1, compression_detected == True, cache_break_events == system_prompt_changes",
+            "analysis": [],
+            "system_prompt_hashes": [
+              "none"
+            ],
+            "scenario_id": "E3_compression_ok",
+            "messages_count": 0,
+            "has_snapshots": false
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        },
+        {
+          "id": "E4_system_prompt_byte_stable",
+          "pass": true,
+          "score": 1.0,
+          "details": {
+            "scenario": "E4_system_prompt_byte_stable",
+            "cache_break_events": 0,
+            "system_prompt_changes": 0,
+            "toolset_mutations": 0,
+            "all_hashes_identical": true,
+            "unique_hashes": 1,
+            "expected": "cache_break_events == 0, toolset_mutations == 0, all system prompt hashes identical",
+            "analysis": [],
+            "system_prompt_hashes": [
+              "none"
+            ],
+            "scenario_id": "E4_system_prompt_byte_stable",
+            "messages_count": 0,
+            "has_snapshots": false
+          },
+          "api_calls": 0,
+          "duration_s": 0.0
+        }
+      ],
+      "duration_s": 0.13,
+      "runner_exit_code": 0,
+      "runner_stderr": "[1/4] E1_cache_stable: A 20-turn conversation with a fixed system prompt and an immutable toolset. The \n  [2/4] E2_toolset_swap_forbidden: Mid-conversation the user attempts to add a new toolset (\"add the web search too\n  [3/4] E3_compression_ok: Conversation grows past the compression threshold (artificially lowered via conf\n  [4/4] E4_system_prompt_byte_stable: A 5-turn conversation where the user sends varied queries (factual, creative, to\nReport written to C:\\Users\\Rog\\hermes-agent-source\\evals\\reports\\cost_cache.json"
+    }
+  ]
+}

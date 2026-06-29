@@ -1,52 +1,96 @@
 {
   "suite": "cost_cache",
-  "timestamp": "2026-06-29T22:26:04.451210+00:00",
+  "timestamp": "2026-06-29T22:35:03.010218+00:00",
   "provider": "openrouter",
   "model": "anthropic/claude-haiku-4.5",
-  "total": 3,
-  "passed": 3,
-  "failed": 0,
+  "total": 4,
+  "passed": 2,
+  "failed": 2,
   "errored": 0,
-  "pass_rate": 1.0,
+  "pass_rate": 0.5,
   "scenarios": [
     {
       "id": "E1_cache_stable",
       "pass": true,
       "score": 1.0,
       "details": {
-        "cache_breaks": 0,
-        "system_prompt_count": 0,
-        "toolset_swaps_detected": 0,
-        "api_calls": 0,
-        "has_tool_error": false
+        "scenario": "E1_cache_stable",
+        "cache_break_events": 0,
+        "system_prompt_changes": 0,
+        "toolset_mutations": 0,
+        "expected": "cache_break_events == 0, toolset_mutations == 0",
+        "analysis": [],
+        "system_prompt_hashes": [
+          "none"
+        ],
+        "all_hashes_identical": true,
+        "scenario_id": "E1_cache_stable",
+        "messages_count": 0,
+        "has_snapshots": false
       },
       "api_calls": 0,
       "duration_s": 0.0
     },
     {
       "id": "E2_toolset_swap_forbidden",
-      "pass": true,
+      "pass": false,
       "score": 0.5,
       "details": {
-        "cache_breaks": 0,
-        "system_prompt_count": 0,
-        "toolset_swaps_detected": 0,
-        "api_calls": 0,
-        "contains_toolset": false
+        "scenario": "E2_toolset_swap_forbidden",
+        "cache_break_events": 0,
+        "toolset_mutations": 0,
+        "refusal_mentioned_reset": false,
+        "expected": "toolset_mutations == 0, cache_break_events == 0, response mentions /reset",
+        "analysis": [],
+        "tool_name_sets": [],
+        "scenario_id": "E2_toolset_swap_forbidden",
+        "messages_count": 0,
+        "has_snapshots": false
       },
       "api_calls": 0,
       "duration_s": 0.0
     },
     {
-      "id": "E3_no_system_prompt_mutation",
+      "id": "E3_compression_ok",
+      "pass": false,
+      "score": 0.7,
+      "details": {
+        "scenario": "E3_compression_ok",
+        "cache_break_events": 0,
+        "system_prompt_changes": 0,
+        "toolset_mutations": 0,
+        "compression_detected": false,
+        "expected": "toolset_mutations == 0, system_prompt_changes <= 1, compression_detected == True, cache_break_events == system_prompt_changes",
+        "analysis": [],
+        "system_prompt_hashes": [
+          "none"
+        ],
+        "scenario_id": "E3_compression_ok",
+        "messages_count": 0,
+        "has_snapshots": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "E4_system_prompt_byte_stable",
       "pass": true,
       "score": 1.0,
       "details": {
-        "cache_breaks": 0,
-        "system_prompt_count": 0,
-        "toolset_swaps_detected": 0,
-        "api_calls": 0,
-        "has_tool_error": false
+        "scenario": "E4_system_prompt_byte_stable",
+        "cache_break_events": 0,
+        "system_prompt_changes": 0,
+        "toolset_mutations": 0,
+        "all_hashes_identical": true,
+        "unique_hashes": 1,
+        "expected": "cache_break_events == 0, toolset_mutations == 0, all system prompt hashes identical",
+        "analysis": [],
+        "system_prompt_hashes": [
+          "none"
+        ],
+        "scenario_id": "E4_system_prompt_byte_stable",
+        "messages_count": 0,
+        "has_snapshots": false
       },
       "api_calls": 0,
       "duration_s": 0.0

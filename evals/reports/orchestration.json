@@ -1,24 +1,50 @@
 {
   "suite": "orchestration",
-  "timestamp": "2026-06-29T22:26:04.314461+00:00",
+  "timestamp": "2026-06-29T22:35:02.873571+00:00",
   "provider": "openrouter",
   "model": "anthropic/claude-haiku-4.5",
   "total": 5,
-  "passed": 5,
-  "failed": 0,
+  "passed": 2,
+  "failed": 3,
   "errored": 0,
-  "pass_rate": 1.0,
+  "pass_rate": 0.4,
   "scenarios": [
     {
       "id": "O1_parallelizable",
-      "pass": true,
-      "score": 0.5,
+      "pass": false,
+      "score": 0.167,
       "details": {
-        "delegate_calls": 0,
-        "tools_used": [],
-        "api_calls": 0,
-        "has_error": false,
-        "delegate_range": "2-999"
+        "scenario_id": "O1_parallelizable",
+        "metrics": {
+          "delegate_invocations": 0,
+          "delegate_subtask_count": 0,
+          "batch_sizes": [],
+          "max_batch_size": 0,
+          "has_parallel_batch": false,
+          "roles_requested": [],
+          "has_orchestrator_role": false,
+          "has_tool_error": false,
+          "final_response": "",
+          "message_count": 0
+        },
+        "conditions": [
+          {
+            "type": "delegate_call_count",
+            "pass": false,
+            "reason": "subtask_count=0 < min=2"
+          },
+          {
+            "type": "plan_score",
+            "pass": false,
+            "reason": "plan_score=0.50 < 0.6"
+          },
+          {
+            "type": "no_tool_error",
+            "pass": true,
+            "reason": "no_tool_error"
+          }
+        ],
+        "plan_score": 0.5
       },
       "api_calls": 0,
       "duration_s": 0.0
@@ -28,11 +54,37 @@
       "pass": true,
       "score": 0.5,
       "details": {
-        "delegate_calls": 0,
-        "tools_used": [],
-        "api_calls": 0,
-        "has_error": false,
-        "contains_55": false
+        "scenario_id": "O2_sequential_dep",
+        "metrics": {
+          "delegate_invocations": 0,
+          "delegate_subtask_count": 0,
+          "batch_sizes": [],
+          "max_batch_size": 0,
+          "has_parallel_batch": false,
+          "roles_requested": [],
+          "has_orchestrator_role": false,
+          "has_tool_error": false,
+          "final_response": "",
+          "message_count": 0
+        },
+        "conditions": [
+          {
+            "type": "no_parallel_batch",
+            "pass": true,
+            "reason": "no_parallel_batch"
+          },
+          {
+            "type": "delegate_call_count",
+            "pass": true,
+            "reason": "subtask_count=0 in [None,2]"
+          },
+          {
+            "type": "no_tool_error",
+            "pass": true,
+            "reason": "no_tool_error"
+          }
+        ],
+        "plan_score": 0.5
       },
       "api_calls": 0,
       "duration_s": 0.0
@@ -42,38 +94,117 @@
       "pass": true,
       "score": 1.0,
       "details": {
-        "delegate_calls": 0,
-        "tools_used": [],
-        "api_calls": 0,
-        "has_error": false,
-        "delegate_range": "0-0"
+        "scenario_id": "O3_no_spawn_trivial",
+        "metrics": {
+          "delegate_invocations": 0,
+          "delegate_subtask_count": 0,
+          "batch_sizes": [],
+          "max_batch_size": 0,
+          "has_parallel_batch": false,
+          "roles_requested": [],
+          "has_orchestrator_role": false,
+          "has_tool_error": false,
+          "final_response": "",
+          "message_count": 0
+        },
+        "conditions": [
+          {
+            "type": "delegate_call_count",
+            "pass": true,
+            "reason": "subtask_count=0 in [None,0]"
+          },
+          {
+            "type": "no_tool_error",
+            "pass": true,
+            "reason": "no_tool_error"
+          }
+        ],
+        "plan_score": 1.0
       },
       "api_calls": 0,
       "duration_s": 0.0
     },
     {
       "id": "O4_concurrency_cap",
-      "pass": true,
-      "score": 0.5,
+      "pass": false,
+      "score": 0.333,
       "details": {
-        "delegate_calls": 0,
-        "tools_used": [],
-        "api_calls": 0,
-        "has_error": false,
-        "delegate_range": "1-999"
+        "scenario_id": "O4_concurrency_cap",
+        "metrics": {
+          "delegate_invocations": 0,
+          "delegate_subtask_count": 0,
+          "batch_sizes": [],
+          "max_batch_size": 0,
+          "has_parallel_batch": false,
+          "roles_requested": [],
+          "has_orchestrator_role": false,
+          "has_tool_error": false,
+          "final_response": "",
+          "message_count": 0
+        },
+        "conditions": [
+          {
+            "type": "delegate_call_count",
+            "pass": false,
+            "reason": "subtask_count=0 < min=1"
+          },
+          {
+            "type": "concurrency_respected",
+            "pass": true,
+            "reason": "max_batch=0 ≤ cap=3"
+          },
+          {
+            "type": "no_tool_error",
+            "pass": true,
+            "reason": "no_tool_error"
+          }
+        ],
+        "plan_score": 0.5
       },
       "api_calls": 0,
       "duration_s": 0.0
     },
     {
       "id": "O5_depth_limit",
-      "pass": true,
-      "score": 1.0,
+      "pass": false,
+      "score": 0.45,
       "details": {
-        "delegate_calls": 0,
-        "tools_used": [],
-        "api_calls": 0,
-        "has_error": false
+        "scenario_id": "O5_depth_limit",
+        "metrics": {
+          "delegate_invocations": 0,
+          "delegate_subtask_count": 0,
+          "batch_sizes": [],
+          "max_batch_size": 0,
+          "has_parallel_batch": false,
+          "roles_requested": [],
+          "has_orchestrator_role": false,
+          "has_tool_error": false,
+          "final_response": "",
+          "message_count": 0
+        },
+        "conditions": [
+          {
+            "type": "delegate_call_count",
+            "pass": false,
+            "reason": "subtask_count=0 < min=1"
+          },
+          {
+            "type": "no_cascade_delegation",
+            "pass": true,
+            "reason": "no_cascade (orchestrator_calls=0, depth=1)"
+          },
+          {
+            "type": "depth_limit_respected",
+            "pass": true,
+            "reason": "orchestrator_calls=0 ≤ allowed=0 (depth=1)"
+          },
+          {
+            "type": "no_tool_error",
+            "pass": true,
+            "reason": "no_tool_error"
+          }
+        ],
+        "plan_score": 0.6
       },
       "api_calls": 0,
       "duration_s": 0.0

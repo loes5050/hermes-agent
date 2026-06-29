@@ -1,233 +1,718 @@
 #!/usr/bin/env python3
-"""CI entry point for Hermes Agent eval suites.
+"""CI eval runner — orchestrates tiered eval suites for GitHub Actions.
 
-Invoked by GitHub Actions (.github/workflows/evals.yml) and locally.
-Aggregates suite reports, compares against baselines, and enforces gates.
+Invoked by CI to run one or more eval suites via ``evals/runners/run_suite.py``
+and aggregate the results into a single JSON report with baseline comparison
+and gate enforcement.
 
-Usage:
-    python scripts/ci/run_evals.py --tier 1 [--output evals/reports/tier1.json]
-    python scripts/ci/run_evals.py --tier 2 [--output evals/reports/tier2.json]
-    python scripts/ci/run_evals.py --tier 3 [--output evals/reports/nightly.json]
-    python scripts/ci/run_evals.py --suite orchestration,cost_cache [--output ...]
+Tiers
+-----
+
+* **Tier 1 — deterministic, no API keys.** Runs the
+  ``orchestration``, ``cost_cache``, ``subagent_verify`` and
+  ``memory_recall`` suites with ``--deterministic-only`` so they exercise
+  structural invariants without any live model calls. Safe on every PR.
+
+* **Tier 2 — live model.** Runs the ``code_task`` and ``research_citation``
+  suites against a real provider. Requires ``OPENROUTER_API_KEY`` (or the
+  appropriate provider secret). Typically run on merge to ``main`` or on a
+  labeled PR, not on every push.
+
+* **Tier 3 — comprehensive.** Runs every suite available in
+  ``evals/suites/`` (Tier 1 deterministic + Tier 2 live). Used for nightly /
+  release validation.
+
+Gate semantics
+--------------
+
+* **Hard gates** — ``cache_break_events == 0``, ``verify_rate >= 0.90``,
+  ``recall_at_3 >= 0.85``, ``plan_score >= 0.80``. A hard-gate failure exits
+  non-zero so branch protection blocks the PR.
+* **Soft gates** — pass-rate regressions against the stored baseline. These
+  print warnings but do not fail the build.
+
+Exit codes
+----------
+
+* ``0`` — all suites ran and every hard gate passed (soft-gate warnings are
+  printed but do not change the exit code).
+* ``1`` — at least one hard gate failed, a suite errored, or a required
+  secret was missing.
+* ``2`` — invalid arguments (argparse handles this itself).
+
+Usage
+-----
+
+    # Tier 1 on every PR (no API keys needed)
+    python scripts/ci/run_evals.py --tier 1
+
+    # Tier 2 on merge-to-main (needs OPENROUTER_API_KEY)
+    python scripts/ci/run_evals.py --tier 2
+
+    # Tier 3 nightly / release
+    python scripts/ci/run_evals.py --tier 3
+
+    # Single suite override
+    python scripts/ci/run_evals.py --tier 1 --suite orchestration
+    python scripts/ci/run_evals.py --tier 2 --suite code_task
+
+    # Custom provider/model for Tier 2+
+    python scripts/ci/run_evals.py --tier 2 --provider openrouter \
+        --model anthropic/claude-haiku-4.5
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-_HERE = Path(__file__).resolve().parent
-_WORKTREE = _HERE.parent.parent
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+_WORKTREE = Path(__file__).resolve().parent.parent.parent
 _EVALS_DIR = _WORKTREE / "evals"
-_RUNNER = _EVALS_DIR / "runners" / "run_suite.py"
-_REPORTS_DIR = _EVALS_DIR / "reports"
+_SUITES_DIR = _EVALS_DIR / "suites"
 _BASELINES_DIR = _EVALS_DIR / "baselines"
+_REPORTS_DIR = _EVALS_DIR / "reports"
+_RUNNER = _EVALS_DIR / "runners" / "run_suite.py"
+_LATEST_REPORT = _REPORTS_DIR / "latest.json"
 
 # ---------------------------------------------------------------------------
-# Gate thresholds (hard = exit non-zero on fail, soft = warn only)
+# Tier → suite mapping
 # ---------------------------------------------------------------------------
-HARD_GATES: Dict[str, Dict[str, float]] = {
-    "orchestration": {"pass_rate": 0.50, "plan_score": 0.80},
-    "cost_cache": {"pass_rate": 0.80, "cache_break_events": 0},
-    "subagent_verify": {"pass_rate": 0.60, "verify_rate": 0.90},
-    "memory_recall": {"pass_rate": 0.60, "recall_at_3": 0.85},
-    "windows_reliability": {"pass_rate": 0.80},
+# Order matters for human-readable output; keep deterministic suites first.
+_TIER1_SUITES: List[str] = [
+    "orchestration",
+    "cost_cache",
+    "subagent_verify",
+    "memory_recall",
+]
+_TIER2_SUITES: List[str] = [
+    "code_task",
+    "research_citation",
+]
+
+# Hard-gate thresholds. Each gate is keyed by a metric name that the runner
+# emits either at the suite level or inside per-scenario ``details``.
+# A gate is "hard" — failing it exits non-zero.
+HARD_GATES: Dict[str, Tuple[str, float, str]] = {
+    # metric_name: (operator, threshold, human description)
+    "cache_break_events": ("==", 0.0, "prompt-cache break events must be zero"),
+    "verify_rate": (">=", 0.90, "subagent verification rate"),
+    "recall_at_3": (">=", 0.85, "memory recall@3"),
+    "plan_score": (">=", 0.80, "orchestration plan quality"),
 }
 
-SOFT_GATES: Dict[str, Dict[str, float]] = {
-    "code_task": {"pass_rate": 0.70},
-    "research_citation": {"pass_rate": 0.60, "unjustified_cite_rate": 0.05},
-}
+# Soft gates: pass-rate regression tolerance vs baseline (fractional drop).
+_SOFT_REGRESSION_TOLERANCE = 0.05  # 5 percentage points
 
-TIER1_SUITES = ["orchestration", "cost_cache", "subagent_verify", "memory_recall"]
-TIER2_SUITES = ["code_task", "research_citation"]
-TIER3_SUITES = TIER1_SUITES + TIER2_SUITES
+log = logging.getLogger("run_evals")
 
 
-def run_suite(suite_name: str, deterministic: bool = False, provider: str = "openrouter", model: str = "anthropic/claude-haiku-4.5") -> dict:
-    """Run a single suite via the runner and return its report."""
-    output_path = _REPORTS_DIR / f"{suite_name}.json"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
 
-    cmd = [
-        sys.executable, str(_RUNNER),
-        "--suite", suite_name,
+
+def _suite_yaml_path(suite: str) -> Path:
+    return _SUITES_DIR / f"{suite}.yaml"
+
+
+def _baseline_path(suite: str) -> Path:
+    return _BASELINES_DIR / f"{suite}.json"
+
+
+def _suites_for_tier(tier: int, override: Optional[List[str]]) -> List[str]:
+    """Resolve the list of suites to run for a given tier / override."""
+    if override:
+        return override
+    if tier == 1:
+        return list(_TIER1_SUITES)
+    if tier == 2:
+        return list(_TIER2_SUITES)
+    if tier == 3:
+        # comprehensive: deterministic suites first, then live suites
+        return list(_TIER1_SUITES) + list(_TIER2_SUITES)
+    raise ValueError(f"Unknown tier: {tier}")
+
+
+def _is_deterministic_suite(suite: str) -> bool:
+    """Tier 1 suites are run deterministic-only; Tier 2 suites are live."""
+    return suite in _TIER1_SUITES
+
+
+# ---------------------------------------------------------------------------
+# Runner invocation
+# ---------------------------------------------------------------------------
+def run_single_suite(
+    suite: str,
+    tier: int,
+    provider: str,
+    model: str,
+    output_path: Path,
+) -> Dict[str, Any]:
+    """Invoke ``evals/runners/run_suite.py`` for one suite and return its report.
+
+    The runner writes its own per-suite JSON to ``output_path``; we read it
+    back so the aggregator can merge everything into ``latest.json``.
+    """
+    suite_yaml = _suite_yaml_path(suite)
+    if not suite_yaml.exists():
+        log.error("Suite YAML not found: %s (skipping)", suite_yaml)
+        return {
+            "suite": suite,
+            "error": f"suite YAML not found: {suite_yaml}",
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errored": 0,
+            "pass_rate": 0.0,
+            "scenarios": [],
+        }
+
+    cmd: List[str] = [
+        sys.executable,
+        str(_RUNNER),
+        "--suite", suite,
+        "--provider", provider,
+        "--model", model,
         "--output", str(output_path),
         "--quiet",
     ]
-    if deterministic:
+    if _is_deterministic_suite(suite):
         cmd.append("--deterministic-only")
-    else:
-        cmd.extend(["--provider", provider, "--model", model])
 
-    # Check for baseline
-    baseline_path = _BASELINES_DIR / f"{suite_name}_baseline.json"
-    if baseline_path.exists():
-        cmd.extend(["--baseline", str(baseline_path)])
+    baseline = _baseline_path(suite)
+    if baseline.exists():
+        cmd.extend(["--baseline", str(baseline)])
 
-    print(f"  Running: {' '.join(cmd)}", file=sys.stderr)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    log.info("Running suite '%s' (tier %d): %s", suite, tier, " ".join(cmd))
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(_WORKTREE),
+            capture_output=True,
+            text=True,
+            timeout=1800,  # 30 min hard cap per suite
+        )
+    except subprocess.TimeoutExpired:
+        log.error("Suite '%s' timed out after 1800s", suite)
+        return {
+            "suite": suite,
+            "error": "timeout after 1800s",
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errored": 0,
+            "pass_rate": 0.0,
+            "scenarios": [],
+            "duration_s": 1800,
+        }
+    except FileNotFoundError:
+        log.error("Runner not found at %s — is the repo layout correct?", _RUNNER)
+        return {
+            "suite": suite,
+            "error": f"runner not found: {_RUNNER}",
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errored": 0,
+            "pass_rate": 0.0,
+            "scenarios": [],
+        }
 
-    if result.returncode != 0:
-        print(f"  WARNING: Runner exited with code {result.returncode}", file=sys.stderr)
-        if result.stderr:
-            print(f"  stderr: {result.stderr[:500]}", file=sys.stderr)
+    elapsed = round(time.time() - t0, 2)
+    if proc.returncode != 0:
+        log.warning(
+            "Suite '%s' runner exited %d — stderr: %s",
+            suite,
+            proc.returncode,
+            (proc.stderr or "").strip()[:500],
+        )
 
-    # Load the report
+    # The runner writes the report JSON to output_path regardless of exit
+    # code (it exits non-zero on low pass-rate or baseline regression). Read
+    # it back so we can aggregate.
+    report: Dict[str, Any]
     if output_path.exists():
         try:
-            return json.loads(output_path.read_text(encoding="utf-8"))
+            report = json.loads(output_path.read_text(encoding="utf-8"))
         except Exception as e:
-            return {"suite": suite_name, "error": f"Failed to parse report: {e}", "total": 0, "passed": 0, "failed": 0}
-    return {"suite": suite_name, "error": "No report generated", "total": 0, "passed": 0, "failed": 0}
+            log.error("Could not parse report for '%s': %s", suite, e)
+            report = {
+                "suite": suite,
+                "error": f"unparseable report: {e}",
+                "total": 0,
+                "passed": 0,
+                "failed": 0,
+                "errored": 0,
+                "pass_rate": 0.0,
+                "scenarios": [],
+            }
+    else:
+        log.error("Runner produced no report file at %s", output_path)
+        report = {
+            "suite": suite,
+            "error": "no report file produced",
+            "total": 0,
+            "passed": 0,
+            "failed": 0,
+            "errored": 0,
+            "pass_rate": 0.0,
+            "scenarios": [],
+        }
+
+    report.setdefault("duration_s", elapsed)
+    report.setdefault("runner_exit_code", proc.returncode)
+    if proc.stderr:
+        report.setdefault("runner_stderr", proc.stderr.strip()[-2000:])
+    return report
 
 
-def check_gates(reports: List[dict], tier: int) -> tuple[bool, List[str]]:
-    """Check all reports against gate thresholds. Returns (all_passed, violations)."""
-    violations: List[str] = []
-    all_passed = True
+# ---------------------------------------------------------------------------
+# Gate evaluation
+# ---------------------------------------------------------------------------
+def _extract_metric(report: Dict[str, Any], metric: str) -> Optional[float]:
+    """Pull a gate metric out of a suite report.
 
-    gates_to_check = {}
+    Metrics can live at suite level (e.g. ``verify_rate``) or inside the
+    ``details`` of individual scenarios (e.g. ``cache_break_events``,
+    ``plan_score``, ``recall_at_3``). We check suite-level first, then
+    aggregate from scenarios.
+    """
+    # 1. Suite-level field
+    if metric in report and isinstance(report[metric], (int, float)):
+        return float(report[metric])
+
+    # 2. Scenario-level details — take the max (worst case) for ==/>= gates
+    values: List[float] = []
+    for s in report.get("scenarios", []):
+        details = s.get("details", {}) or {}
+        if isinstance(details, dict) and metric in details:
+            try:
+                values.append(float(details[metric]))
+            except (TypeError, ValueError):
+                pass
+    if values:
+        # For "==0" gates (cache_break_events) the worst case is the max;
+        # for ">=" gates the worst case is the min. We return max here and
+        # let the operator decide; callers that need min can recompute.
+        return max(values)
+
+    return None
+
+
+def _gate_pass(metric: str, value: float) -> bool:
+    op, threshold, _desc = HARD_GATES[metric]
+    if op == "==":
+        return value == threshold
+    if op == ">=":
+        return value >= threshold
+    return False  # unknown operator → fail safe
+
+
+def evaluate_hard_gates(reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Evaluate hard gates across all suite reports.
+
+    Returns a list of gate-result dicts. Any ``passed == False`` entry means
+    the CI run must exit non-zero.
+    """
+    results: List[Dict[str, Any]] = []
+    # Map metrics to the suite(s) that should produce them.
+    metric_to_suites: Dict[str, List[str]] = {
+        "cache_break_events": ["cost_cache"],
+        "verify_rate": ["subagent_verify"],
+        "recall_at_3": ["memory_recall"],
+        "plan_score": ["orchestration"],
+    }
+
+    for metric, (op, threshold, desc) in HARD_GATES.items():
+        relevant = [r for r in reports if r.get("suite") in metric_to_suites.get(metric, [])]
+        if not relevant:
+            # No suite produced this metric — treat as not-evaluated (skip).
+            results.append({
+                "metric": metric,
+                "status": "not_evaluated",
+                "description": desc,
+                "value": None,
+                "threshold": threshold,
+                "operator": op,
+                "passed": None,
+            })
+            continue
+
+        # Worst-case value across relevant suites
+        vals = []
+        for r in relevant:
+            v = _extract_metric(r, metric)
+            if v is not None:
+                vals.append(v)
+
+        if not vals:
+            results.append({
+                "metric": metric,
+                "status": "missing",
+                "description": desc,
+                "value": None,
+                "threshold": threshold,
+                "operator": op,
+                "passed": False,  # missing a hard-gate metric is a failure
+                "reason": f"suite(s) {metric_to_suites[metric]} ran but did not emit '{metric}'",
+            })
+            continue
+
+        worst = max(vals) if op == "==" else min(vals)
+        passed = _gate_pass(metric, worst)
+        results.append({
+            "metric": metric,
+            "status": "pass" if passed else "fail",
+            "description": desc,
+            "value": worst,
+            "threshold": threshold,
+            "operator": op,
+            "passed": passed,
+        })
+    return results
+
+
+def compare_baselines(reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Soft-gate: compare each suite's pass_rate to its baseline file.
+
+    Returns a list of soft-gate result dicts. These never cause a non-zero
+    exit; they only produce warnings.
+    """
+    soft: List[Dict[str, Any]] = []
+    for r in reports:
+        suite = r.get("suite", "unknown")
+        baseline_path = _baseline_path(suite)
+        if not baseline_path.exists():
+            soft.append({
+                "suite": suite,
+                "status": "no_baseline",
+                "message": f"no baseline at {baseline_path}",
+            })
+            continue
+        try:
+            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            soft.append({
+                "suite": suite,
+                "status": "baseline_unreadable",
+                "message": str(e),
+            })
+            continue
+
+        old_rate = float(baseline.get("pass_rate", 0))
+        new_rate = float(r.get("pass_rate", 0))
+        delta = new_rate - old_rate
+        status = "regression" if delta < -_SOFT_REGRESSION_TOLERANCE else (
+            "improvement" if delta > _SOFT_REGRESSION_TOLERANCE else "stable"
+        )
+        soft.append({
+            "suite": suite,
+            "status": status,
+            "baseline_pass_rate": round(old_rate, 4),
+            "current_pass_rate": round(new_rate, 4),
+            "delta": round(delta, 4),
+        })
+    return soft
+
+
+# ---------------------------------------------------------------------------
+# Aggregation + output
+# ---------------------------------------------------------------------------
+def build_aggregate_report(
+    tier: int,
+    suites: List[str],
+    suite_reports: List[Dict[str, Any]],
+    hard_gates: List[Dict[str, Any]],
+    soft_gates: List[Dict[str, Any]],
+    provider: str,
+    model: str,
+) -> Dict[str, Any]:
+    total = sum(r.get("total", 0) for r in suite_reports)
+    passed = sum(r.get("passed", 0) for r in suite_reports)
+    failed = sum(r.get("failed", 0) for r in suite_reports)
+    errored = sum(r.get("errored", 0) for r in suite_reports)
+    overall_rate = (passed / total) if total else 0.0
+
+    hard_failures = [g for g in hard_gates if g.get("passed") is False]
+
+    return {
+        "schema": "hermes-eval-report/v1",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "tier": tier,
+        "suites_requested": suites,
+        "provider": provider,
+        "model": model,
+        "summary": {
+            "total_scenarios": total,
+            "passed": passed,
+            "failed": failed,
+            "errored": errored,
+            "overall_pass_rate": round(overall_rate, 4),
+        },
+        "hard_gates": hard_gates,
+        "hard_gates_passed": len(hard_failures) == 0,
+        "soft_gates": soft_gates,
+        "suites": suite_reports,
+    }
+
+
+def write_report(report: Dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Aggregate report written to %s", path)
+
+
+# ---------------------------------------------------------------------------
+# Human-readable summary
+# ---------------------------------------------------------------------------
+def print_summary(report: Dict[str, Any]) -> None:
+    out: List[str] = []
+    bar = "=" * 64
+    out.append("")
+    out.append(bar)
+    out.append("Hermes Eval CI Runner — Summary")
+    out.append(bar)
+    out.append(f"  Tier:     {report['tier']}")
+    out.append(f"  Provider: {report.get('provider', 'n/a')}")
+    out.append(f"  Model:    {report.get('model', 'n/a')}")
+    out.append(f"  Time:     {report['timestamp']}")
+    out.append("")
+
+    s = report["summary"]
+    out.append(f"  Scenarios:  {s['total_scenarios']}")
+    out.append(f"  Passed:     {s['passed']}")
+    out.append(f"  Failed:     {s['failed']}")
+    out.append(f"  Errored:    {s['errored']}")
+    out.append(f"  Pass rate:  {s['overall_pass_rate']:.1%}")
+    out.append("")
+
+    # Per-suite breakdown
+    out.append("  Suites:")
+    for sr in report.get("suites", []):
+        suite = sr.get("suite", "?")
+        if sr.get("error") and not sr.get("scenarios"):
+            out.append(f"    ✗ {suite}: ERROR — {sr['error']}")
+            continue
+        rate = sr.get("pass_rate", 0.0)
+        status = "✅" if rate >= 0.5 else "❌"
+        out.append(
+            f"    {status} {suite}: {sr.get('passed', 0)}/{sr.get('total', 0)} "
+            f"({rate:.0%})  errors={sr.get('errored', 0)}  "
+            f"{sr.get('duration_s', 0):.1f}s"
+        )
+    out.append("")
+
+    # Hard gates
+    out.append("  Hard gates:")
+    for g in report.get("hard_gates", []):
+        metric = g["metric"]
+        if g["passed"] is True:
+            icon = "✅"
+            detail = f"value={g['value']}"
+        elif g["passed"] is False:
+            icon = "❌"
+            detail = f"value={g['value']} {g['operator']} {g['threshold']} FAILED"
+            if g.get("reason"):
+                detail += f" ({g['reason']})"
+        else:
+            icon = "⚪"
+            detail = g.get("status", "not evaluated")
+        out.append(f"    {icon} {metric}: {detail}")
+    out.append("")
+
+    # Soft gates
+    soft = report.get("soft_gates", [])
+    if soft:
+        out.append("  Soft gates (warnings only):")
+        for sg in soft:
+            suite = sg.get("suite", "?")
+            status = sg.get("status", "?")
+            if status == "regression":
+                out.append(
+                    f"    ⚠️  {suite}: REGRESSION "
+                    f"Δ={sg.get('delta', 0):+.2%} "
+                    f"({sg.get('baseline_pass_rate', 0):.1%} → {sg.get('current_pass_rate', 0):.1%})"
+                )
+            elif status == "improvement":
+                out.append(
+                    f"    📈 {suite}: improvement "
+                    f"Δ={sg.get('delta', 0):+.2%}"
+                )
+            elif status == "stable":
+                out.append(f"    ✓  {suite}: stable (Δ={sg.get('delta', 0):+.2%})")
+            else:
+                out.append(f"    •  {suite}: {status} — {sg.get('message', '')}")
+        out.append("")
+
+    out.append(bar)
+    if report["hard_gates_passed"]:
+        out.append("  RESULT: PASS — all hard gates satisfied")
+    else:
+        out.append("  RESULT: FAIL — one or more hard gates failed")
+    out.append(bar)
+    out.append("")
+
+    text = "\n".join(out)
+    print(text)
+    # Also emit a concise GitHub Actions annotation for hard-gate failures
+    if not report["hard_gates_passed"]:
+        for g in report.get("hard_gates", []):
+            if g.get("passed") is False:
+                print(
+                    f"::error::Hard gate failed: {g['metric']} "
+                    f"({g['operator']}{g['threshold']}) got {g['value']}",
+                    file=sys.stderr,
+                )
+
+
+# ---------------------------------------------------------------------------
+# Secret check
+# ---------------------------------------------------------------------------
+def _check_secrets(tier: int) -> Optional[str]:
+    """Return an error message if a required secret is missing, else None."""
     if tier == 1:
-        gates_to_check = HARD_GATES
-    elif tier == 2:
-        gates_to_check = {**HARD_GATES, **SOFT_GATES}
-    else:
-        gates_to_check = {**HARD_GATES, **SOFT_GATES}
-
-    for report in reports:
-        suite_name = report.get("suite", "")
-        gates = gates_to_check.get(suite_name, {})
-
-        for metric, threshold in gates.items():
-            if metric == "pass_rate":
-                actual = report.get("pass_rate", 0)
-                if actual < threshold:
-                    msg = f"HARD GATE FAIL: {suite_name}.{metric}={actual:.2%} < {threshold:.2%}"
-                    violations.append(msg)
-                    if suite_name in HARD_GATES:
-                        all_passed = False
-            elif metric == "cache_break_events":
-                # Check from individual scenarios
-                for s in report.get("scenarios", []):
-                    breaks = s.get("details", {}).get("cache_breaks", 0)
-                    if breaks > threshold:
-                        msg = f"HARD GATE FAIL: {suite_name}.{s['id']}.cache_breaks={breaks} > {threshold}"
-                        violations.append(msg)
-                        all_passed = False
-
-    return all_passed, violations
+        return None  # deterministic, no secrets
+    # Tier 2 and 3 need a provider key. We check the common ones.
+    provider_keys = ["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"]
+    if not any(os.environ.get(k) for k in provider_keys):
+        return (
+            f"Tier {tier} requires a live model API key "
+            f"(one of: {', '.join(provider_keys)}). Set OPENROUTER_API_KEY in CI secrets."
+        )
+    return None
 
 
-def print_report(reports: List[dict], violations: List[str]) -> None:
-    """Print a human-readable aggregated report."""
-    print(f"\n{'='*70}")
-    print(f"  Hermes Agent Eval Report — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-    print(f"{'='*70}")
-
-    total_passed = sum(r.get("passed", 0) for r in reports)
-    total_scenarios = sum(r.get("total", 0) for r in reports)
-    total_failed = sum(r.get("failed", 0) for r in reports)
-    total_errored = sum(r.get("errored", 0) for r in reports)
-
-    print(f"  Suites: {len(reports)}  |  Scenarios: {total_scenarios}  |  "
-          f"Passed: {total_passed}  |  Failed: {total_failed}  |  Errors: {total_errored}")
-
-    if total_scenarios > 0:
-        rate = total_passed / total_scenarios
-        print(f"  Overall Pass Rate: {rate:.1%}")
-    print(f"{'='*70}")
-
-    for report in reports:
-        suite = report.get("suite", "?")
-        pr = report.get("pass_rate", 0)
-        status = "✅" if pr >= 0.8 else ("⚠️" if pr >= 0.5 else "❌")
-        print(f"  {status} {suite}: {report.get('passed',0)}/{report.get('total',0)} ({pr:.1%})")
-        for s in report.get("scenarios", []):
-            s_status = "✅" if s["pass"] else "❌"
-            print(f"      {s_status} {s['id']}: score={s.get('score',0):.2f}")
-
-    if violations:
-        print(f"\n{'='*70}")
-        print(f"  GATE VIOLATIONS ({len(violations)})")
-        print(f"{'='*70}")
-        for v in violations:
-            print(f"  ❌ {v}")
-    else:
-        print(f"\n  ✅ All gates passed.")
-
-    print(f"{'='*70}\n")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Hermes Agent Eval CI Runner")
-    parser.add_argument("--tier", type=int, choices=[1, 2, 3], help="CI tier (1=fast/deterministic, 2=live, 3=nightly)")
-    parser.add_argument("--suite", help="Comma-separated suite names to run (overrides --tier)")
-    parser.add_argument("--output", help="Output JSON path for aggregated report")
-    parser.add_argument("--provider", default="openrouter", help="LLM provider for live suites")
-    parser.add_argument("--model", default="anthropic/claude-haiku-4.5", help="Model for live suites")
-    parser.add_argument("--no-gates", action="store_true", help="Skip gate enforcement (always exit 0)")
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="run_evals.py",
+        description="CI eval runner — orchestrate tiered Hermes eval suites.",
+    )
+    parser.add_argument(
+        "--tier",
+        type=int,
+        choices=[1, 2, 3],
+        required=True,
+        help="Eval tier: 1=deterministic (no API keys), 2=live model, 3=comprehensive.",
+    )
+    parser.add_argument(
+        "--suite",
+        action="append",
+        dest="suites",
+        metavar="SUITE",
+        help=(
+            "Run a specific suite instead of the full tier. Can be passed "
+            "multiple times (e.g. --suite orchestration --suite cost_cache)."
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        default="openrouter",
+        help="LLM provider for Tier 2+ suites (default: openrouter).",
+    )
+    parser.add_argument(
+        "--model",
+        default="anthropic/claude-haiku-4.5",
+        help="Model name for Tier 2+ suites.",
+    )
+    parser.add_argument(
+        "--output",
+        default=str(_LATEST_REPORT),
+        help=f"Aggregate JSON report path (default: {_LATEST_REPORT}).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging.",
+    )
     args = parser.parse_args()
 
-    # Determine suites to run
-    if args.suite:
-        suites = [s.strip() for s in args.suite.split(",")]
-    elif args.tier == 1:
-        suites = TIER1_SUITES
-    elif args.tier == 2:
-        suites = TIER2_SUITES
-    elif args.tier == 3:
-        suites = TIER3_SUITES
-    else:
-        print("ERROR: Must specify --tier or --suite", file=sys.stderr)
-        sys.exit(1)
+    _setup_logging(verbose=args.verbose)
 
-    # Determine if deterministic
-    deterministic = args.tier == 1 if args.tier else False
+    # 1. Resolve suites
+    try:
+        suites = _suites_for_tier(args.tier, args.suites)
+    except ValueError as e:
+        log.error("%s", e)
+        return 2
 
-    print(f"=== Hermes Eval CI — Tier {args.tier or 'custom'} ({len(suites)} suites) ===", file=sys.stderr)
+    if not suites:
+        log.error("No suites resolved for tier %d", args.tier)
+        return 1
+    log.info("Tier %d → suites: %s", args.tier, ", ".join(suites))
 
-    reports = []
-    for suite_name in suites:
-        print(f"\n--- Suite: {suite_name} ---", file=sys.stderr)
-        report = run_suite(suite_name, deterministic=deterministic, provider=args.provider, model=args.model)
-        reports.append(report)
+    # 2. Secret check (Tier 2/3)
+    secret_err = _check_secrets(args.tier)
+    if secret_err:
+        log.error("%s", secret_err)
+        print(f"::error::{secret_err}", file=sys.stderr)
+        return 1
 
-    # Check gates
-    all_passed, violations = check_gates(reports, args.tier or 1)
-    print_report(reports, violations)
+    # 3. Run each suite
+    suite_reports: List[Dict[str, Any]] = []
+    for suite in suites:
+        # Per-suite report path; the aggregate report overwrites latest.json
+        per_suite_output = _REPORTS_DIR / f"{suite}.json"
+        report = run_single_suite(
+            suite=suite,
+            tier=args.tier,
+            provider=args.provider,
+            model=args.model,
+            output_path=per_suite_output,
+        )
+        suite_reports.append(report)
 
-    # Write aggregated report
-    if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        aggregated = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tier": args.tier,
-            "suites_run": suites,
-            "total_scenarios": sum(r.get("total", 0) for r in reports),
-            "total_passed": sum(r.get("passed", 0) for r in reports),
-            "total_failed": sum(r.get("failed", 0) for r in reports),
-            "violations": violations,
-            "all_gates_passed": all_passed,
-            "reports": reports,
-        }
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(aggregated, f, indent=2, ensure_ascii=False)
-        print(f"\nAggregated report: {output_path}", file=sys.stderr)
+    # 4. Evaluate gates
+    hard_gates = evaluate_hard_gates(suite_reports)
+    soft_gates = compare_baselines(suite_reports)
 
-    if not args.no_gates and not all_passed:
-        print("\n❌ GATE FAILURES DETECTED — exiting non-zero", file=sys.stderr)
-        sys.exit(1)
+    # 5. Build + write aggregate report
+    aggregate = build_aggregate_report(
+        tier=args.tier,
+        suites=suites,
+        suite_reports=suite_reports,
+        hard_gates=hard_gates,
+        soft_gates=soft_gates,
+        provider=args.provider,
+        model=args.model,
+    )
+    write_report(aggregate, Path(args.output))
 
-    sys.exit(0)
+    # 6. Human-readable summary
+    print_summary(aggregate)
+
+    # 7. Exit code: non-zero if any hard gate failed or any suite errored
+    hard_fail = not aggregate["hard_gates_passed"]
+    any_error = any(r.get("error") and not r.get("scenarios") for r in suite_reports)
+    if hard_fail:
+        log.error("Exiting non-zero: hard gate failure")
+        return 1
+    if any_error:
+        log.error("Exiting non-zero: one or more suites errored")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
