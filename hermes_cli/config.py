@@ -1006,7 +1006,10 @@ DEFAULT_CONFIG = {
         # verification narrative was more noise than signal for most users
         # (it fired on doc/markdown/skill edits too). Set true to opt in, or
         # "auto" for the legacy surface-aware behavior (on for interactive
-        # coding surfaces, off for conversational messaging surfaces).
+        # coding surfaces, off for conversational messaging surfaces), or
+        # "gate" to activate the M2 verifier gate — a bounded re-entry loop
+        # that checks the evidence ledger and re-enters the conversation loop
+        # when code edits lack passing evidence (see agent.verify_gate below).
         "verify_on_stop": False,
         # Verifier gate (M2) — evidence-bound completion gating.
         # Active only when verify_on_stop is set to "gate".
@@ -1628,7 +1631,51 @@ DEFAULT_CONFIG = {
             "extra_body": {},
         },
     },
-    
+
+    # Mixture-of-Agents (MoA) configuration.  The MoA tool itself
+    # (tools/mixture_of_agents_tool.py) has module-level defaults; this block
+    # lets users override models/temperatures via config and enables the M3
+    # CriticGate (agent/critic_gate.py) for automatic step-level critique.
+    "moa": {
+        # Named presets — each preset is a (reference_models, aggregator,
+        # reference_temperature) triple.  The default preset is implicit
+        # (used by the mixture_of_agents tool when no override is given).
+        # The "critic" preset is used by CriticGate; its references are framed
+        # as devil's advocates (see agent/critic_gate._CRITIC_REFERENCE_PREAMBLE).
+        "presets": {
+            "critic": {
+                # Reference models that generate diverse critiques in parallel.
+                # Defaults mirror the MoA tool's REFERENCE_MODELS so the critic
+                # works out-of-the-box; override here for a cheaper/different
+                # panel.
+                "reference_models": [
+                    "anthropic/claude-opus-4.6",
+                    "google/gemini-2.5-pro",
+                    "openai/gpt-5.4-pro",
+                ],
+                # Aggregator model that synthesises reference critiques into a
+                # single actionable blob.
+                "aggregator": "anthropic/claude-opus-4.6",
+                # Higher than the MoA default (0.6) to encourage diverse,
+                # divergent critique perspectives.
+                "reference_temperature": 0.8,
+            },
+        },
+        # Automatic step-level critique (M3 CriticGate).  When enabled, the
+        # gate fires every ``cadence_steps`` steps and injects a critique as
+        # a synthetic user message appended to the last user turn (same
+        # pattern as moa_loop — preserves role alternation and prompt cache).
+        # Off by default — opt in explicitly.  See agent/critic_gate.py.
+        "auto_critique": {
+            "enabled": False,            # opt-in; off by default
+            "cadence_steps": 3,           # fire every N steps (step_count % N == 0)
+            "max_concurrent_critics": 3,  # cap parallel reference-model calls
+            # Future: route critic references through delegate_task for
+            # isolation.  No effect in the basic version.
+            "diverge_via_delegation": False,
+        },
+    },
+
     "display": {
         "compact": False,
         "personality": "",
@@ -2234,6 +2281,12 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "keep": 5,  # retain last N regular snapshots
         },
+        # Strategy curator (M5) — meta-skill extraction from PlanStore.
+        # When enabled, the curator reads successful plans (status=done)
+        # and extracts recurring step patterns to propose skill improvements.
+        "strategy_pass": False,
+        "strategy_min_successes": 3,
+        "strategy_extract_model": "",
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
@@ -3021,6 +3074,52 @@ DEFAULT_CONFIG = {
         "disable_gpu": "auto",
     },
 
+    # ─────────────────────────────────────────────────────────────────────
+    # Planning subsystem (M1 PlanStore).
+    #
+    # A SQLite-backed plan ledger at <HERMES_HOME>/plans.db that lets the
+    # agent decompose a complex request into a plan + ordered steps, work
+    # them one at a time, and record verification evidence before marking a
+    # step done. See ``agent/plan_store.py`` (storage) and the ``planning``
+    # plugin (``hermes plan`` CLI). No model tools are added by this
+    # subsystem — the planning *skill* drives decomposition; the ledger +
+    # CLI are the operator/agent-facing surface.
+    #
+    # Bumping ``_config_version`` is NOT required for additive (optional)
+    # config keys; the deep-merge in ``load_config`` back-fills missing
+    # keys from DEFAULT_CONFIG, so existing configs silently gain these
+    # defaults on next load.
+    # ─────────────────────────────────────────────────────────────────────
+    "planning": {
+        # Master switch for the plan ledger. When false, ``agent.plan_store``
+        # still works (the module is importable) but the planning plugin
+        # does not register its CLI and the agent is not expected to create
+        # plans automatically. Default false in M1 — the feature ships dark
+        # and is opted in per-install; flip to true to enable.
+        "enabled": False,
+        # When true, the agent may auto-create a plan for a request it judges
+        # complex (multi-step, needs decomposition). When false the agent
+        # only creates plans on explicit user request. Only consulted when
+        # ``enabled`` is true.
+        "auto_create_on_complex": True,
+        # Hard cap on the number of steps a single plan may hold. Guards
+        # against runaway decomposition; the planning skill should split
+        # rather than exceed this. 40 keeps a plan a single screenful.
+        "max_steps": 40,
+        # Turns a step may stay ``active`` before it is considered stale and
+        # surfaced for re-planning. The agent loop checks this; the ledger
+        # itself does not enforce it (storage is passive).
+        "step_timeout_turns": 8,
+        # Run a self-critique pass over the plan every N completed steps.
+        # 0 disables self-critique. The critique blob is stored on the
+        # relevant step(s) as ``critique_json``.
+        "critique_cadence": 3,
+        # Janitor: plans whose status is ``done``, ``failed``, or
+        # ``superseded`` are pruned from the ledger after this many days.
+        # In-flight plans are never pruned regardless of age. 0 disables
+        # pruning. Drives ``hermes plan prune --days``.
+        "ledger_retention_days": 30,
+    },
 
     # Config schema version - bump this when adding new required fields
     "_config_version": 31,
