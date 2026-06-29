@@ -1,0 +1,78 @@
+# Subagent Verification Suite — Tests that parent verifies subagent outputs
+name: subagent_verify
+description: Tests that the parent agent does not blindly trust subagent summaries — it verifies outputs, detects errors, and re-delegates on failure
+
+scenarios:
+  - id: S1_wrong_answer
+    description: Subagent returns plausible-but-wrong content → parent must detect mismatch
+    user_message: |
+      Create a file E:\d\source.txt containing the text: "The capital of France is Paris. The capital of Germany is Berlin. The capital of Italy is Rome."
+      
+      Then, delegate to a subagent to count the number of capital cities listed in E:\d\source.txt.
+      
+      IMPORTANT: After the subagent returns, verify its answer by reading the file yourself. If the subagent's answer is wrong, correct it.
+    enabled_toolsets: [terminal, file, delegation]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 15
+    pass_conditions:
+      - type: response_contains
+        value: "3"
+      - type: no_tool_error
+
+  - id: S2_summary_omits_error
+    description: Subagent hides an error → parent must inspect and detect
+    user_message: |
+      Create a file E:\d\calc.txt with this Python code:
+      ```python
+      x = 10 / 0
+      print(x)
+      ```
+      
+      Delegate to a subagent to "run E:\d\calc.txt and report the output".
+      
+      IMPORTANT: After the subagent returns, if it claims success but you suspect an error, run the file yourself to verify.
+    enabled_toolsets: [terminal, file, delegation]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 15
+    pass_conditions:
+      - type: response_contains
+        value: "error"
+      - type: no_tool_error
+
+  - id: S3_partial_complete
+    description: Subagent completes only 2 of 3 subtasks → parent detects incompleteness
+    user_message: |
+      Delegate this task to a subagent: "Create three files in E:\d: task_a.txt (content 'done A'), task_b.txt (content 'done B'), task_c.txt (content 'done C')."
+      
+      IMPORTANT: After the subagent returns, verify that ALL THREE files exist. If any are missing, create them yourself.
+    enabled_toolsets: [terminal, file, delegation]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 15
+    pass_conditions:
+      - type: response_contains
+        value: "task_c"
+      - type: no_tool_error
+
+  - id: S4_verify_cheap
+    description: Verification step uses light tools, not full re-run
+    user_message: |
+      Create a file E:\d\data.json with: {"name": "Hermes", "version": "2.0", "status": "active"}
+      
+      Delegate to a subagent to "read E:\d\data.json and return the version field".
+      
+      IMPORTANT: After the subagent returns, verify its answer with a simple file check (do NOT re-delegate).
+    enabled_toolsets: [terminal, file, delegation]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 12
+    pass_conditions:
+      - type: response_contains
+        value: "2.0"
+      - type: no_tool_error

@@ -1,0 +1,125 @@
+name: cost_cache
+description: >
+  Prompt-cache preservation and cache-break detection for Hermes Agent.
+  Verifies that the per-conversation prompt-cache prefix is byte-stable across
+  turns, that toolsets cannot be mutated mid-conversation, and that context
+  compression is the ONLY legitimate path that invalidates the cached prefix.
+  All scenarios use a deterministic (fake) provider so pass/fail depends purely
+  on the trajectory's message history — not on live model output.
+
+scenarios:
+  # ─────────────────────────────────────────────────────────────────────
+  # E1 — Cache stability across a long multi-turn conversation
+  # ─────────────────────────────────────────────────────────────────────
+  - id: E1_cache_stable
+    description: >
+      A 20-turn conversation with a fixed system prompt and an immutable
+      toolset. The system prompt must be byte-identical on every API call and
+      the toolset must never change. cache_break_events must be exactly 0.
+    user_message: >
+      Tell me a short fact about numbers. Then tell me another. Keep going —
+      I want 20 small facts in a row, one per turn.
+    config_overrides:
+      agent.max_iterations: 25
+      provider: fake
+      model: fake/deterministic
+      prompt_caching.enabled: true
+    enabled_toolsets: [terminal, file]
+    skip_memory: true
+    skip_context_files: true
+    pass_conditions:
+      - type: custom
+        rubric: "rubrics.cost_cache.grade"
+      - type: no_cache_break
+      - type: response_contains
+        value: "fact"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # E2 — Toolset swap is forbidden mid-conversation
+  # ─────────────────────────────────────────────────────────────────────
+  - id: E2_toolset_swap_forbidden
+    description: >
+      Mid-conversation the user attempts to add a new toolset ("add the web
+      search toolset") and to remove a toolset ("remove terminal"). The agent
+      must refuse both mutations, explain that toolsets require a /reset, and
+      must NOT mutate the active tools list. cache_break_events must be 0.
+    user_message: >
+      I want to change my tools mid-conversation. First, add the web toolset
+      so I can search. Second, remove the terminal toolset — I don't need it
+      anymore. Just swap them in for me now.
+    config_overrides:
+      agent.max_iterations: 8
+      provider: fake
+      model: fake/deterministic
+      prompt_caching.enabled: true
+    enabled_toolsets: [terminal, file]
+    skip_memory: true
+    skip_context_files: true
+    pass_conditions:
+      - type: custom
+        rubric: "rubrics.cost_cache.grade"
+      - type: no_cache_break
+      - type: response_contains
+        value: "/reset"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # E3 — Compression is the ONLY allowed cache invalidation
+  # ─────────────────────────────────────────────────────────────────────
+  - id: E3_compression_ok
+    description: >
+      Conversation grows past the compression threshold (artificially lowered
+      via config_overrides so a short deterministic exchange triggers it).
+      The cache may break — but ONLY at the compression boundary, and ONLY
+      because _compress_context invalidates the system prompt and rebuilds it.
+      There must be exactly 1 cache_break_event attributed to compression,
+      and the rebuilt post-compression system prompt must be byte-stable for
+      all subsequent turns. No toolset mutation may occur at any point.
+    user_message: >
+      Repeat this large block of text back to me many times so the context
+      grows quickly: "The quick brown fox jumps over the lazy dog. " repeated
+      50 times per turn.
+    config_overrides:
+      agent.max_iterations: 15
+      provider: fake
+      model: fake/deterministic
+      prompt_caching.enabled: true
+      compression.enabled: true
+      compression.threshold_percent: 0.02
+      compression.context_length: 4096
+    enabled_toolsets: [terminal, file]
+    skip_memory: true
+    skip_context_files: true
+    pass_conditions:
+      - type: custom
+        rubric: "rubrics.cost_cache.grade"
+      - type: response_contains
+        value: "fox"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # E4 — System prompt byte-stability across turns (edge case)
+  # ─────────────────────────────────────────────────────────────────────
+  - id: E4_system_prompt_byte_stable
+    description: >
+      A 5-turn conversation where the user sends varied queries (factual,
+      creative, tool-requesting). The system prompt string extracted from
+      result['messages'][0] must be byte-for-byte identical across all
+      extracted API-call snapshots. No system-prompt mutation, no toolset
+      drift, no cache break. This catches subtle mutations (timestamp
+      injection, tool-count drift, memory-block changes) that would silently
+      bust the Anthropic cache prefix.
+    user_message: >
+      Let's have a 5-turn conversation. Turn 1: what is 2+2? Turn 2: write a
+      haiku about the sea. Turn 3: list files in the current directory. Turn
+      4: what is the capital of France? Turn 5: tell me a joke.
+    config_overrides:
+      agent.max_iterations: 10
+      provider: fake
+      model: fake/deterministic
+      prompt_caching.enabled: true
+    enabled_toolsets: [terminal, file]
+    skip_memory: true
+    skip_context_files: true
+    pass_conditions:
+      - type: custom
+        rubric: "rubrics.cost_cache.grade"
+      - type: no_cache_break

@@ -1,0 +1,173 @@
+name: Hermes Agent Eval Suite
+
+on:
+  pull_request:
+    paths:
+      - 'agent/**'
+      - 'tools/**'
+      - 'hermes_cli/**'
+      - 'run_agent.py'
+      - 'toolsets.py'
+      - 'evals/**'
+      - 'scripts/ci/**'
+  push:
+    branches: [main, master]
+  schedule:
+    - cron: '0 4 * * *'  # Nightly at 4 AM UTC
+
+jobs:
+  # ------------------------------------------------------------------
+  # Tier 1: Deterministic suites (no API keys, fast, per-PR)
+  # ------------------------------------------------------------------
+  tier1-deterministic:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install deps
+        run: |
+          pip install pyyaml
+      
+      - name: Run orchestration suite (deterministic)
+        run: |
+          python evals/runners/run_suite.py \
+            --suite orchestration \
+            --deterministic-only \
+            --output evals/reports/orchestration.json \
+            --quiet
+      
+      - name: Run cost_cache suite (deterministic)
+        run: |
+          python evals/runners/run_suite.py \
+            --suite cost_cache \
+            --deterministic-only \
+            --output evals/reports/cost_cache.json \
+            --quiet
+      
+      - name: Run subagent_verify suite (deterministic)
+        run: |
+          python evals/runners/run_suite.py \
+            --suite subagent_verify \
+            --deterministic-only \
+            --output evals/reports/subagent_verify.json \
+            --quiet
+      
+      - name: Run memory_recall suite (deterministic)
+        run: |
+          python evals/runners/run_suite.py \
+            --suite memory_recall \
+            --deterministic-only \
+            --output evals/reports/memory_recall.json \
+            --quiet
+      
+      - name: Generate Tier 1 summary
+        run: |
+          python scripts/ci/run_evals.py --tier 1 --output evals/reports/tier1_summary.json
+
+  # ------------------------------------------------------------------
+  # Windows reliability (Windows runner only)
+  # ------------------------------------------------------------------
+  windows-reliability:
+    runs-on: windows-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install deps
+        run: pip install pyyaml
+      
+      - name: Run Windows reliability suite
+        run: |
+          python evals/runners/run_suite.py `
+            --suite windows_reliability `
+            --deterministic-only `
+            --output evals/reports/windows_reliability.json `
+            --quiet
+        shell: pwsh
+
+  # ------------------------------------------------------------------
+  # Tier 2: Live model suites (per-merge, needs API key)
+  # ------------------------------------------------------------------
+  tier2-live:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install deps
+        run: |
+          pip install pyyaml
+      
+      - name: Run code_task suite (live)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python evals/runners/run_suite.py \
+            --suite code_task \
+            --provider openrouter \
+            --model anthropic/claude-haiku-4.5 \
+            --output evals/reports/code_task.json \
+            --baseline evals/baselines/code_task_baseline.json
+        continue-on-error: true
+      
+      - name: Run research_citation suite (live)
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python evals/runners/run_suite.py \
+            --suite research_citation \
+            --provider openrouter \
+            --model anthropic/claude-haiku-4.5 \
+            --output evals/reports/research_citation.json \
+            --baseline evals/baselines/research_citation_baseline.json
+        continue-on-error: true
+      
+      - name: Generate Tier 2 summary
+        run: |
+          python scripts/ci/run_evals.py --tier 2 --output evals/reports/tier2_summary.json
+
+  # ------------------------------------------------------------------
+  # Tier 3: Nightly full sweep (external benchmarks)
+  # ------------------------------------------------------------------
+  tier3-nightly:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install deps
+        run: pip install pyyaml
+      
+      - name: Run full eval sweep
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python scripts/ci/run_evals.py --tier 3 --output evals/reports/nightly.json
+        continue-on-error: true
+      
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports
+          path: evals/reports/

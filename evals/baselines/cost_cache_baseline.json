@@ -1,0 +1,55 @@
+{
+  "suite": "cost_cache",
+  "timestamp": "2026-06-29T22:26:04.451210+00:00",
+  "provider": "openrouter",
+  "model": "anthropic/claude-haiku-4.5",
+  "total": 3,
+  "passed": 3,
+  "failed": 0,
+  "errored": 0,
+  "pass_rate": 1.0,
+  "scenarios": [
+    {
+      "id": "E1_cache_stable",
+      "pass": true,
+      "score": 1.0,
+      "details": {
+        "cache_breaks": 0,
+        "system_prompt_count": 0,
+        "toolset_swaps_detected": 0,
+        "api_calls": 0,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "E2_toolset_swap_forbidden",
+      "pass": true,
+      "score": 0.5,
+      "details": {
+        "cache_breaks": 0,
+        "system_prompt_count": 0,
+        "toolset_swaps_detected": 0,
+        "api_calls": 0,
+        "contains_toolset": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "E3_no_system_prompt_mutation",
+      "pass": true,
+      "score": 1.0,
+      "details": {
+        "cache_breaks": 0,
+        "system_prompt_count": 0,
+        "toolset_swaps_detected": 0,
+        "api_calls": 0,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    }
+  ]
+}

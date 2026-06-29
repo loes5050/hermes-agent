@@ -1,0 +1,56 @@
+{
+  "suite": "windows_reliability",
+  "timestamp": "2026-06-29T22:26:04.924133+00:00",
+  "provider": "openrouter",
+  "model": "anthropic/claude-haiku-4.5",
+  "total": 4,
+  "passed": 4,
+  "failed": 0,
+  "errored": 0,
+  "pass_rate": 1.0,
+  "scenarios": [
+    {
+      "id": "W1_encoding",
+      "pass": true,
+      "score": 0.5,
+      "details": {
+        "contains_مرحبا بالعالم": false,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "W2_longpath",
+      "pass": true,
+      "score": 0.5,
+      "details": {
+        "contains_deep file content": false,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "W3_home_spaces",
+      "pass": true,
+      "score": 1.0,
+      "details": {
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "W4_unicode_arg",
+      "pass": true,
+      "score": 0.5,
+      "details": {
+        "contains_ملف": false,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    }
+  ]
+}

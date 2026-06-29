@@ -1,0 +1,54 @@
+# Windows Reliability Suite
+name: windows_reliability
+description: Tests Hermes Agent reliability on Windows 10/11 with MSYS2 git-bash shell
+
+scenarios:
+  - id: W1_encoding
+    description: Non-ASCII path and content handling (Arabic, CJK, emoji)
+    user_message: "Create a file named 'اختبار_🖥️.txt' in E:\\d with content 'مرحبا بالعالم 🎉'. Then read it back and confirm the content matches."
+    enabled_toolsets: [terminal, file]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 6
+    pass_conditions:
+      - type: response_contains
+        value: "مرحبا بالعالم"
+      - type: no_tool_error
+
+  - id: W2_longpath
+    description: Path longer than 260 characters handling
+    user_message: "Create a deeply nested directory structure under E:\\d\\longpath_test with at least 10 levels (each level named 'subdir_N'). Create a file at the deepest level containing 'deep file content'. Then read it back."
+    enabled_toolsets: [terminal, file]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 10
+    pass_conditions:
+      - type: response_contains
+        value: "deep file content"
+      - type: no_tool_error
+
+  - id: W3_home_spaces
+    description: HERMES_HOME with spaces in path
+    user_message: "List all files in the current directory and count how many Python files (*.py) there are. Report the count."
+    enabled_toolsets: [terminal, file]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 5
+    pass_conditions:
+      - type: no_tool_error
+
+  - id: W4_unicode_arg
+    description: Emoji and RTL text in user goal
+    user_message: "احسب عدد الملفات في المجلد الحالي 🎯 وأخبرني بالنتيجة بالعربية"
+    enabled_toolsets: [terminal, file]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 5
+    pass_conditions:
+      - type: response_contains
+        value: "ملف"
+      - type: no_tool_error

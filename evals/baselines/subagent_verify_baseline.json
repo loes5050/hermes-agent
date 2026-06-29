@@ -1,0 +1,73 @@
+{
+  "suite": "subagent_verify",
+  "timestamp": "2026-06-29T22:26:04.621655+00:00",
+  "provider": "openrouter",
+  "model": "anthropic/claude-haiku-4.5",
+  "total": 4,
+  "passed": 4,
+  "failed": 0,
+  "errored": 0,
+  "pass_rate": 1.0,
+  "scenarios": [
+    {
+      "id": "S1_wrong_answer",
+      "pass": true,
+      "score": 0.7,
+      "details": {
+        "delegate_calls": 0,
+        "verify_tools_after": [],
+        "verify_rate": 1.0,
+        "api_calls": 0,
+        "has_error": false,
+        "contains_3": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "S2_summary_omits_error",
+      "pass": true,
+      "score": 0.7,
+      "details": {
+        "delegate_calls": 0,
+        "verify_tools_after": [],
+        "verify_rate": 1.0,
+        "api_calls": 0,
+        "has_error": false,
+        "contains_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "S3_partial_complete",
+      "pass": true,
+      "score": 0.7,
+      "details": {
+        "delegate_calls": 0,
+        "verify_tools_after": [],
+        "verify_rate": 1.0,
+        "api_calls": 0,
+        "has_error": false,
+        "contains_task_c": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "S4_verify_cheap",
+      "pass": true,
+      "score": 0.7,
+      "details": {
+        "delegate_calls": 0,
+        "verify_tools_after": [],
+        "verify_rate": 1.0,
+        "api_calls": 0,
+        "has_error": false,
+        "contains_2.0": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+# Memory Recall Suite — Tests cross-session memory retrieval quality
+name: memory_recall
+description: Tests that the agent retrieves the right memory at the right time, handles distractors, respects stale overrides, and stays honest on clean state
+
+scenarios:
+  - id: M1_cross_session
+    description: Fact stored in one turn, retrieved in another
+    user_message: |
+      Step 1: Save this fact to memory — "The project Alpha uses port 9090 for its API."
+      Step 2: Now retrieve what port project Alpha uses. Report only the port number.
+    enabled_toolsets: [terminal, memory]
+    skip_memory: false
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 8
+    pass_conditions:
+      - type: response_contains
+        value: "9090"
+      - type: no_tool_error
+
+  - id: M2_distractor
+    description: 50 seeded memories, only 1 relevant → relevant in top-3
+    user_message: |
+      I'm working on project Beta. What do you remember about project Beta from your memory?
+      (Note: there may be many memories stored, but only one about project Beta)
+    enabled_toolsets: [terminal, memory]
+    skip_memory: false
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 8
+    pass_conditions:
+      - type: no_tool_error
+
+  - id: M3_stale_override
+    description: Old fact + newer correction → newer wins
+    user_message: |
+      Step 1: Save to memory: "The database host is db-old.example.com"
+      Step 2: Save to memory: "UPDATE: The database host is now db-new.example.com"
+      Step 3: What is the current database host? Report the hostname.
+    enabled_toolsets: [terminal, memory]
+    skip_memory: false
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 10
+    pass_conditions:
+      - type: response_contains
+        value: "db-new"
+      - type: no_tool_error
+
+  - id: M4_no_memory_clean
+    description: Fresh HERMES_HOME → agent should not hallucinate memories
+    user_message: |
+      What do you remember about a project called "Phantom" from previous sessions?
+    enabled_toolsets: [terminal, memory]
+    skip_memory: true
+    skip_context_files: true
+    config_overrides:
+      agent.max_iterations: 6
+    pass_conditions:
+      - type: no_tool_error

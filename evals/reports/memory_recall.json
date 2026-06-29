@@ -1,0 +1,67 @@
+{
+  "suite": "memory_recall",
+  "timestamp": "2026-06-29T22:26:04.784966+00:00",
+  "provider": "openrouter",
+  "model": "anthropic/claude-haiku-4.5",
+  "total": 4,
+  "passed": 4,
+  "failed": 0,
+  "errored": 0,
+  "pass_rate": 1.0,
+  "scenarios": [
+    {
+      "id": "M1_cross_session",
+      "pass": true,
+      "score": 0.5,
+      "details": {
+        "memory_ops": 0,
+        "api_calls": 0,
+        "response_length": 0,
+        "contains_9090": false,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "M2_distractor",
+      "pass": true,
+      "score": 1.0,
+      "details": {
+        "memory_ops": 0,
+        "api_calls": 0,
+        "response_length": 0,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "M3_stale_override",
+      "pass": true,
+      "score": 0.5,
+      "details": {
+        "memory_ops": 0,
+        "api_calls": 0,
+        "response_length": 0,
+        "contains_db-new": false,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    },
+    {
+      "id": "M4_no_memory_clean",
+      "pass": true,
+      "score": 1.0,
+      "details": {
+        "memory_ops": 0,
+        "api_calls": 0,
+        "response_length": 0,
+        "has_tool_error": false
+      },
+      "api_calls": 0,
+      "duration_s": 0.0
+    }
+  ]
+}
