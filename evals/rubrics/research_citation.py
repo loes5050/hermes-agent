@@ -7,6 +7,34 @@ uncertainty flagging, and multi-hop chaining.
 import re
 
 
+def _is_actual_tool_error(output: str) -> bool:
+    """Return True only for real tool failures, not benign mentions of 'error'.
+
+    Catches: tracebacks, non-zero exits, HTTP failures, exceptions.
+    Ignores: web page content, curl progress, docs mentioning 'error'.
+    """
+    lower = output.lower()
+
+    # Genuine failures
+    if "traceback (most recent call last)" in lower:
+        return True
+    if "syntaxerror" in lower or "importerror" in lower or "modulenotfound" in lower:
+        return True
+    if "zerodivisionerror" in lower or "attributeerror" in lower or "typeerror:" in lower:
+        return True
+    if "command not found" in lower:
+        return True
+    if lower.startswith("error:") or "\nerror:" in lower:
+        return True
+
+    # HTTP-level failures
+    if any(code in lower for code in [" 500 ", " 502 ", " 503 ", " 401 unauthorized", " 403 forbidden"]):
+        return True
+
+    # Don't flag benign web content
+    return False
+
+
 def grade(scenario: dict, result: dict) -> dict:
     """Score a research citation scenario.
 
@@ -42,13 +70,14 @@ def grade(scenario: dict, result: dict) -> dict:
         ]
     )
 
-    # Check for tool errors
+    # Check for REAL tool errors (not benign mentions)
     has_error = False
     for msg in messages:
         if msg.get("role") == "tool":
             content = str(msg.get("content", ""))
             lower = content.lower()
-            if "error" in lower and "no error" not in lower:
+            # Only flag actual failures, not benign mentions of "error"
+            if _is_actual_tool_error(content):
                 has_error = True
                 break
 
