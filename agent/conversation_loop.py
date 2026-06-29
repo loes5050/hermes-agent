@@ -4774,60 +4774,41 @@ def run_conversation(
                         verify_on_stop_enabled,
                     )
 
+                    _verify_nudge = None
                     if verify_on_stop_enabled():
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
                             attempts=getattr(agent, "_verification_stop_nudges", 0),
                         )
-                    else:
-                        _verify_nudge = None
+
+                    # ── M2 VerifierGate ────────────────────────────────
+                    # When agent.verify_on_stop is "gate", check the evidence
+                    # ledger before accepting the final answer. If any edited
+                    # path lacks fresh passing evidence and we haven't hit the
+                    # attempt budget, inject a synthetic user continuation and
+                    # re-enter the loop. The gate is bounded by
+                    # verify_gate.max_attempts (default 3); after that it
+                    # returns None and the existing nudge path below handles the
+                    # degrade. The gate respects prompt caching and role
+                    # alternation — it only appends a synthetic user message,
+                    # never mutates the system prompt or past context.
+                    if _verify_nudge is None:
+                        try:
+                            from agent.verifier_gate import gate_continuation
+
+                            _gate_msg = gate_continuation(
+                                session_id=getattr(agent, "session_id", None),
+                                changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                                attempts=getattr(agent, "_verification_stop_nudges", 0),
+                            )
+                            if _gate_msg is not None:
+                                _verify_nudge = _gate_msg
+                        except Exception:
+                            logger.debug("verifier gate check failed", exc_info=True)
                 except Exception:
                     logger.debug("verification stop-loop check failed", exc_info=True)
                     _verify_nudge = None
-
-                # ── Verifier gate (verify_on_stop="gate") ──
-                # Runs AFTER the advisory nudge.  When verify_on_stop is
-                # "gate", the gate queries the evidence ledger and can
-                # re-enter the conversation loop (bounded by
-                # verify_gate.max_attempts) — same synthetic-user+continue
-                # pattern as the nudge below.
-                _gate_continuation = None
-                try:
-                    from agent.verifier_gate import (
-                        build_verify_gate_continuation,
-                        verify_on_stop_gate_enabled,
-                        resolve_gate_config,
-                    )
-                    if verify_on_stop_gate_enabled():
-                        _gate_cfg = resolve_gate_config()
-                        _gate_continuation = build_verify_gate_continuation(
-                            session_id=getattr(agent, "session_id", None),
-                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
-                            cwd=getattr(agent, "cwd", "."),
-                            attempts=getattr(agent, "_verification_stop_nudges", 0),
-                            max_attempts=_gate_cfg.get("max_attempts", 3),
-                            allow_ad_hoc=_gate_cfg.get("allow_ad_hoc", True),
-                        )
-                except Exception:
-                    logger.debug("verifier gate check failed", exc_info=True)
-
-                if _gate_continuation:
-                    agent._verification_stop_nudges = (
-                        getattr(agent, "_verification_stop_nudges", 0) + 1
-                    )
-                    final_msg["finish_reason"] = "verification_required"
-                    messages.append(final_msg)
-                    messages.append({
-                        "role": "user",
-                        "content": _gate_continuation,
-                        "_verification_stop_synthetic": True,
-                        "_verifier_gate_synthetic": True,
-                    })
-                    agent._session_messages = messages
-                    logger.debug("verifier gate continuation issued (attempt %d)",
-                                 agent._verification_stop_nudges)
-                    continue
 
                 if _verify_nudge:
                     agent._verification_stop_nudges = (

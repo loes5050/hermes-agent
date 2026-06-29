@@ -1,0 +1,86 @@
+{
+  "suite": "research_citation",
+  "timestamp": "2026-06-29T23:12:26.563559+00:00",
+  "provider": "deepseek",
+  "model": "deepseek-v4-pro",
+  "total": 4,
+  "passed": 1,
+  "failed": 3,
+  "errored": 0,
+  "pass_rate": 0.25,
+  "scenarios": [
+    {
+      "id": "R1_single_source",
+      "pass": false,
+      "score": 0.333,
+      "details": {
+        "citation_count": 2,
+        "urls": [
+          "https://www.python.org/downloads/**",
+          "https://devguide.python.org/versions/**"
+        ],
+        "has_credible_urls": true,
+        "search_count": 10,
+        "has_tool_error": true,
+        "api_calls": 6,
+        "contains_python.org": true
+      },
+      "api_calls": 6,
+      "duration_s": 60.01
+    },
+    {
+      "id": "R2_contradictory",
+      "pass": false,
+      "score": 0.0,
+      "details": {
+        "citation_count": 0,
+        "urls": [],
+        "has_credible_urls": false,
+        "search_count": 4,
+        "has_tool_error": true,
+        "api_calls": 4,
+        "contains_http": false
+      },
+      "api_calls": 4,
+      "duration_s": 26.22
+    },
+    {
+      "id": "R3_no_source",
+      "pass": true,
+      "score": 0.5,
+      "details": {
+        "citation_count": 0,
+        "urls": [],
+        "has_credible_urls": false,
+        "search_count": 2,
+        "has_tool_error": false,
+        "api_calls": 2,
+        "contains_cannot find": true
+      },
+      "api_calls": 2,
+      "duration_s": 15.99
+    },
+    {
+      "id": "R5_multi_hop",
+      "pass": false,
+      "score": 0.333,
+      "details": {
+        "citation_count": 6,
+        "urls": [
+          "https://www.nobelprize.org/prizes/physics/2024/press-release/",
+          "https://www.princeton.edu/news/2024/10/08/princetons-john-hopfield-receives-nobel-prize-physics",
+          "https://www.utoronto.ca/news/geoffrey-hinton-wins-nobel-prize",
+          "https://en.wikipedia.org/wiki/History_of_Princeton_University",
+          "https://en.wikipedia.org/wiki/University_of_Toronto"
+        ],
+        "has_credible_urls": true,
+        "search_count": 6,
+        "has_tool_error": true,
+        "api_calls": 5,
+        "contains_http": true
+      },
+      "api_calls": 5,
+      "duration_s": 27.3
+    }
+  ]
+}

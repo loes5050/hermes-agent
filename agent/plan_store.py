@@ -300,25 +300,33 @@ def _row_to_step(row: sqlite3.Row) -> Dict[str, Any]:
 # Verification evidence cross-check
 # ---------------------------------------------------------------------------
 
-def _evidence_passed(event_id: str) -> Tuple[bool, str]:
-    """Return ``(passed, reason)`` for a verification evidence event id.
+def _evidence_passed(
+    *,
+    session_id: Optional[str],
+    cwd: Optional[str],
+) -> Tuple[bool, str]:
+    """Return ``(passed, reason)`` by cross-checking ``verification_evidence``.
 
-    Looks up ``agent.verification_evidence.verification_status(event_id)`` when
-    that module is importable. Returns ``(True, "passed")`` only when the
-    evidence status is exactly ``"passed"``. Any other status, missing event,
-    or import failure returns ``(False, <reason>)`` — the call fails CLOSED so
-    a broken/missing verification path can never silently mark a step done.
+    Calls ``agent.verification_evidence.verification_status(session_id=...,
+    cwd=...)`` when that module is importable. That function returns a *dict*
+    with a ``"status"`` key (one of ``passed``, ``failed``, ``stale``,
+    ``unverified``, ``not_applicable``). This helper returns ``(True, "passed")``
+    only when that status is exactly ``"passed"``. Any other status, missing
+    result, or import failure returns ``(False, <reason>)`` — the call fails
+    CLOSED so a broken/missing verification path can never silently mark a step
+    done. The caller must pass ``--force`` to override (operator escape hatch).
     """
-    if not event_id:
-        return False, "no evidence_event_id provided"
     try:
         from agent.verification_evidence import verification_status  # type: ignore
     except Exception as exc:  # pragma: no cover — module optional in M1
         return False, f"verification_evidence unavailable: {exc}"
     try:
-        status = verification_status(event_id)
+        result = verification_status(session_id=session_id, cwd=cwd)
     except Exception as exc:
         return False, f"verification_status() raised: {exc}"
+    if not isinstance(result, dict):
+        return False, f"verification_status() returned {type(result).__name__}, expected dict"
+    status = result.get("status")
     if status == "passed":
         return True, "passed"
     return False, f"evidence status is {status!r} (expected 'passed')"
@@ -540,25 +548,40 @@ def complete_step(
     evidence_event_id: Optional[str] = None,
     force: bool = False,
     critique: Optional[Dict[str, Any]] = None,
+    cwd: Optional[str] = None,
+    session_id: Optional[str] = None,
     db_path: Optional[Path] = None,
 ) -> Tuple[bool, str]:
     """Mark a step ``done``, gated on verification evidence.
 
-    When ``evidence_event_id`` is provided AND ``agent.verification_evidence``
-    is importable, the step is only flipped to ``done`` if
-    ``verification_status(event_id) == 'passed'``. Otherwise the call fails
-    closed (step stays in its current status) and the reason is returned,
-    unless ``force=True`` is set — the operator escape hatch, never the
-    default.
+    The gate cross-checks ``agent.verification_evidence.verification_status(
+    session_id=..., cwd=...)`` and only flips the step to ``done`` when the
+    returned status is ``"passed"``. The session id is resolved from the
+    step's parent plan (falling back to the ``session_id`` argument), and
+    ``cwd`` defaults to the process's current directory. The
+    ``evidence_event_id`` (if provided) is recorded on the step as the
+    evidence reference regardless of the gate outcome.
+
+    When ``agent.verification_evidence`` is not importable, the call fails
+    CLOSED (step stays in its current status) unless ``force=True`` — the
+    operator escape hatch, never the default. Any non-``passed`` evidence
+    status also fails closed; ``force`` overrides the gate.
 
     Returns ``(updated: bool, reason: str)``.
     """
-    if not evidence_event_id and not force:
-        return False, (
-            "no evidence_event_id provided; pass --force to complete without evidence"
-        )
-    if not force and evidence_event_id:
-        passed, reason = _evidence_passed(evidence_event_id)
+    if not force:
+        # Resolve the plan's session_id for the verification cross-check.
+        resolved_sid = session_id
+        if resolved_sid is None:
+            with connect_closing(db_path) as conn:
+                row = conn.execute(
+                    "SELECT p.session_id FROM steps s JOIN plans p ON p.id = s.plan_id "
+                    "WHERE s.id=?",
+                    (step_id,),
+                ).fetchone()
+                if row is not None:
+                    resolved_sid = row["session_id"] if row[0] else None
+        passed, reason = _evidence_passed(session_id=resolved_sid, cwd=cwd)
         if not passed:
             return False, f"evidence check failed: {reason}"
     updated = update_step_status(

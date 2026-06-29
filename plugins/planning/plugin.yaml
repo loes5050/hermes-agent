@@ -1,0 +1,9 @@
+name: planning
+version: 0.1.0
+description: "M1 PlanStore — SQLite-backed plan ledger with a `hermes plan` CLI subcommand for creating plans, completing steps (gated on verification evidence), and inspecting status. No model tools; the planning skill drives decomposition, this plugin exposes the operator CLI."
+author: NousResearch
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows

@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -79,7 +80,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     stepdone_p.add_argument("step_id", help="Step id to complete")
     stepdone_p.add_argument(
         "--evidence", default=None,
-        help="Verification evidence event id (required unless --force)",
+        help="Verification evidence event id to record on the step",
     )
     stepdone_p.add_argument(
         "--force", action="store_true",
@@ -88,6 +89,14 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     stepdone_p.add_argument(
         "--critique", default=None,
         help="Optional JSON-encoded critique blob to store with the step",
+    )
+    stepdone_p.add_argument(
+        "--cwd", default=None,
+        help="Working directory for the verification cross-check (default: process cwd)",
+    )
+    stepdone_p.add_argument(
+        "--session-id", default=None,
+        help="Session id for the verification cross-check (default: step's plan session)",
     )
 
     # ── step status (low-level status setter, no evidence gate) ─────────────
@@ -196,11 +205,14 @@ def _dispatch(action: str, args: argparse.Namespace) -> int:
             except json.JSONDecodeError as exc:
                 print(f"error: --critique is not valid JSON: {exc}", file=sys.stderr)
                 return 2
+        cwd = args.cwd if args.cwd is not None else os.getcwd()
         ok, reason = plan_store.complete_step(
             args.step_id,
             evidence_event_id=args.evidence,
             force=args.force,
             critique=critique,
+            cwd=cwd,
+            session_id=args.session_id,
         )
         if not ok:
             print(f"not done: {reason}", file=sys.stderr)
