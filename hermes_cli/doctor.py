@@ -508,6 +508,171 @@ def managed_scope_check() -> None:
         check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")
 
 
+# ---------------------------------------------------------------------------
+# Phase 0.8 — break-glass security warnings & god-file LOC visibility
+# ---------------------------------------------------------------------------
+
+# Files tracked as "god-files" (monolithic entry points) for LOC monitoring.
+# These are the largest single-file modules in the core; tracking their size
+# in doctor gives operators visibility into refactor progress without a
+# separate tool.  Paths are relative to PROJECT_ROOT.
+_GOD_FILES: list[tuple[str, str]] = [
+    ("gateway/run.py", "Gateway runner"),
+    ("cli.py", "Legacy CLI entry"),
+    ("hermes_cli/web_server.py", "Desktop web server"),
+    ("hermes_cli/main.py", "CLI main"),
+    ("run_agent.py", "Agent runner"),
+]
+
+# LOC threshold (per file) above which doctor emits an informational note.
+# Not a warning — these files are known-large by design; the note simply
+# makes the number visible so operators can track decomposition work.
+_GOD_FILE_NOTE_LOC = 5000
+
+
+def _check_breakglass_security(issues: list[str]) -> None:
+    """Warn loudly when break-glass (security-bypass) flags are enabled.
+
+    Reads config safely via ``load_config_readonly`` and **never** prints
+    secret values — only the boolean state of each flag.  Each dangerous
+    flag produces a ``check_fail`` line and an actionable issue entry so it
+    surfaces in the summary block.
+
+    Flags checked (audit 07):
+      - ``delegation.subagent_auto_approve: true``
+      - ``GATEWAY_ALLOW_ALL_USERS`` env var set to a truthy value
+      - ``approvals.mode: off``
+      - ``security.redact_secrets: false``
+      - ``approvals.cron_mode: approve``
+    """
+    _section("Break-Glass Security Flags")
+
+    # --- config.yaml flags --------------------------------------------------
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        cfg = {}
+
+    delegation = cfg.get("delegation") or {}
+    approvals = cfg.get("approvals") or {}
+    security = cfg.get("security") or {}
+
+    _warned = False
+
+    if delegation.get("subagent_auto_approve") is True:
+        check_fail(
+            "delegation.subagent_auto_approve is ON",
+            "(subagents auto-approve dangerous commands without human review)",
+        )
+        issues.append(
+            "Set delegation.subagent_auto_approve: false in config.yaml "
+            "(unless you intentionally trust all delegated work with shell access)"
+        )
+        _warned = True
+
+    _approval_mode = str(approvals.get("mode") or "").strip().lower()
+    if _approval_mode == "off":
+        check_fail(
+            "approvals.mode is OFF",
+            "(all dangerous-command approval prompts are skipped — equivalent to --yolo)",
+        )
+        issues.append(
+            "Set approvals.mode: manual (or smart) in config.yaml; 'off' "
+            "removes the safety gate for every terminal command"
+        )
+        _warned = True
+
+    if security.get("redact_secrets") is False:
+        check_fail(
+            "security.redact_secrets is OFF",
+            "(API keys / tokens may appear in logs, tool output, and model context)",
+        )
+        issues.append(
+            "Set security.redact_secrets: true in config.yaml to re-enable "
+            "secret redaction"
+        )
+        _warned = True
+
+    _cron_mode = str(approvals.get("cron_mode") or "").strip().lower()
+    if _cron_mode == "approve":
+        check_fail(
+            "approvals.cron_mode is APPROVE",
+            "(cron jobs auto-approve every dangerous command — no human in the loop)",
+        )
+        issues.append(
+            "Set approvals.cron_mode: deny in config.yaml so cron jobs "
+            "block on dangerous commands instead of auto-running them"
+        )
+        _warned = True
+
+    # --- GATEWAY_ALLOW_ALL_USERS env flag ----------------------------------
+    _gaa_raw = os.environ.get("GATEWAY_ALLOW_ALL_USERS", "").strip().lower()
+    if _gaa_raw in ("1", "true", "yes", "on"):
+        check_fail(
+            "GATEWAY_ALLOW_ALL_USERS is set",
+            "(any messaging-platform user can drive the bot — no allowlist)",
+        )
+        issues.append(
+            "Unset GATEWAY_ALLOW_ALL_USERS or set it to false; configure an "
+            "allowed_users list instead"
+        )
+        _warned = True
+
+    if not _warned:
+        check_ok("All break-glass security flags are in their safe state")
+
+
+def _check_godfile_loc(issues: list[str]) -> None:
+    """Print a LOC snapshot of the known god-files (Phase 0.8 visibility).
+
+    Pure informational metrics — not warnings.  Gives operators a way to
+    track monolith decomposition progress by running ``hermes doctor``.
+    Files that exceed ``_GOD_FILE_NOTE_LOC`` get an informational arrow.
+    """
+    _section("God-File LOC Snapshot")
+    _total = 0
+    _found = 0
+    for rel, label in _GOD_FILES:
+        _path = PROJECT_ROOT / rel
+        try:
+            _loc = sum(1 for _ in _path.open(encoding="utf-8", errors="replace"))
+        except OSError:
+            check_warn(f"{rel} ({label})", "(file not found)")
+            continue
+        _found += 1
+        _total += _loc
+        if _loc >= _GOD_FILE_NOTE_LOC:
+            check_info(f"{rel}: {_loc:,} LOC — {label}")
+        else:
+            check_ok(f"{rel}: {_loc:,} LOC", f"({label})")
+    if _found:
+        check_info(f"Total across {_found} god-file(s): {_total:,} LOC")
+    else:
+        check_warn("No god-files found", "(PROJECT_ROOT may not be set)")
+
+
+def _check_core_tools_count() -> None:
+    """Print the count of tools in ``toolsets._HERMES_CORE_TOOLS``.
+
+    Surfaced via ``hermes doctor --core-tools``.  Every core tool ships on
+    every API call, so the count is a direct proxy for the model-tool
+    schema footprint.  Informational only.
+    """
+    try:
+        from toolsets import _HERMES_CORE_TOOLS
+        _count = len(_HERMES_CORE_TOOLS)
+    except Exception:
+        check_warn("Could not read _HERMES_CORE_TOOLS")
+        return
+    _section("Core Tool Footprint")
+    check_ok(f"{_count} core tools in _HERMES_CORE_TOOLS")
+    check_info(
+        "Each core tool is sent on every API call; prefer CLI commands, "
+        "skills, service-gated tools, or plugins over new core tools"
+    )
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -1346,6 +1511,14 @@ def run_doctor(args):
 
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)
+
+    # Phase 0.8 — break-glass security flag warnings + god-file LOC snapshot
+    _check_breakglass_security(issues)
+    _check_godfile_loc(issues)
+
+    # Optional --core-tools flag: show _HERMES_CORE_TOOLS count and exit
+    if getattr(args, "core_tools", False):
+        _check_core_tools_count()
 
     if sys.platform != "win32":
         _section("Command Installation")

@@ -1488,3 +1488,203 @@ def test_npm_audit_fix_hint_avoids_crashing_workspace_flag(monkeypatch, tmp_path
     assert "build-time tooling" in out
     assert "known npm bug" in out
     assert "lockfile bump" in out
+
+
+# ---------------------------------------------------------------------------
+# Phase 0.8 — break-glass security warnings & god-file LOC tests
+# ---------------------------------------------------------------------------
+
+class TestBreakGlassSecurityWarnings:
+    """_check_breakglass_security must warn on each dangerous flag."""
+
+    def _run(self, monkeypatch, cfg=None, env=None):
+        from hermes_cli import doctor as doc_mod
+        issues = []
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: cfg or {},
+        )
+        for k, v in (env or {}).items():
+            if v is None:
+                monkeypatch.delenv(k, raising=False)
+            else:
+                monkeypatch.setenv(k, v)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doc_mod._check_breakglass_security(issues)
+        return buf.getvalue(), issues
+
+    def test_safe_defaults_show_ok(self, monkeypatch):
+        out, issues = self._run(
+            monkeypatch,
+            cfg={
+                "delegation": {"subagent_auto_approve": False},
+                "approvals": {"mode": "manual", "cron_mode": "deny"},
+                "security": {"redact_secrets": True},
+            },
+            env={"GATEWAY_ALLOW_ALL_USERS": None},
+        )
+        assert "safe state" in out
+        assert issues == []
+
+    def test_subagent_auto_approve_true_warns(self, monkeypatch):
+        out, issues = self._run(
+            monkeypatch,
+            cfg={"delegation": {"subagent_auto_approve": True}},
+        )
+        assert "subagent_auto_approve is ON" in out
+        assert any("subagent_auto_approve: false" in i for i in issues)
+
+    def test_approvals_mode_off_warns(self, monkeypatch):
+        out, issues = self._run(
+            monkeypatch,
+            cfg={"approvals": {"mode": "off"}},
+        )
+        assert "approvals.mode is OFF" in out
+        assert any("approvals.mode: manual" in i for i in issues)
+
+    def test_redact_secrets_false_warns(self, monkeypatch):
+        out, issues = self._run(
+            monkeypatch,
+            cfg={"security": {"redact_secrets": False}},
+        )
+        assert "redact_secrets is OFF" in out
+        assert any("redact_secrets: true" in i for i in issues)
+
+    def test_cron_mode_approve_warns(self, monkeypatch):
+        out, issues = self._run(
+            monkeypatch,
+            cfg={"approvals": {"cron_mode": "approve"}},
+        )
+        assert "cron_mode is APPROVE" in out
+        assert any("cron_mode: deny" in i for i in issues)
+
+    @pytest.mark.parametrize("val", ["1", "true", "yes", "on", "TRUE", "Yes"])
+    def test_gateway_allow_all_users_truthy_warns(self, monkeypatch, val):
+        out, issues = self._run(
+            monkeypatch,
+            env={"GATEWAY_ALLOW_ALL_USERS": val},
+        )
+        assert "GATEWAY_ALLOW_ALL_USERS is set" in out
+        assert any("GATEWAY_ALLOW_ALL_USERS" in i for i in issues)
+
+    @pytest.mark.parametrize("val", ["0", "false", "", "no", "off"])
+    def test_gateway_allow_all_users_falsy_does_not_warn(self, monkeypatch, val):
+        out, issues = self._run(
+            monkeypatch,
+            env={"GATEWAY_ALLOW_ALL_USERS": val},
+        )
+        assert "GATEWAY_ALLOW_ALL_USERS" not in out
+        assert not any("GATEWAY_ALLOW_ALL_USERS" in i for i in issues)
+
+    def test_all_flags_at_once_produces_five_issues(self, monkeypatch):
+        out, issues = self._run(
+            monkeypatch,
+            cfg={
+                "delegation": {"subagent_auto_approve": True},
+                "approvals": {"mode": "off", "cron_mode": "approve"},
+                "security": {"redact_secrets": False},
+            },
+            env={"GATEWAY_ALLOW_ALL_USERS": "true"},
+        )
+        assert len(issues) == 5
+        # Each dangerous flag must produce a check_fail line
+        assert "subagent_auto_approve is ON" in out
+        assert "approvals.mode is OFF" in out
+        assert "redact_secrets is OFF" in out
+        assert "cron_mode is APPROVE" in out
+        assert "GATEWAY_ALLOW_ALL_USERS is set" in out
+
+    def test_never_prints_secret_values(self, monkeypatch):
+        """Even if config has secret-like keys, only flag state is printed."""
+        out, issues = self._run(
+            monkeypatch,
+            cfg={
+                "delegation": {"subagent_auto_approve": False},
+                "approvals": {"mode": "manual"},
+                "security": {
+                    "redact_secrets": True,
+                    "api_key": "sk-super-secret-12345",
+                },
+            },
+        )
+        assert "sk-super-secret-12345" not in out
+
+    def test_missing_config_does_not_crash(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {} or None,
+        )
+        from hermes_cli import doctor as doc_mod
+        issues = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doc_mod._check_breakglass_security(issues)
+        # No config at all → safe-state OK (no flags enabled)
+        assert "safe state" in buf.getvalue()
+        assert issues == []
+
+
+class TestGodFileLocSnapshot:
+    """_check_godfile_loc must report LOC for known god-files."""
+
+    def test_reports_all_known_god_files(self, monkeypatch, capsys):
+        from hermes_cli import doctor as doc_mod
+        issues = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doc_mod._check_godfile_loc(issues)
+        out = buf.getvalue()
+        # All 5 god-files should appear
+        assert "gateway/run.py" in out
+        assert "cli.py" in out
+        assert "hermes_cli/web_server.py" in out
+        assert "hermes_cli/main.py" in out
+        assert "run_agent.py" in out
+        # Total line must appear
+        assert "Total across" in out
+        # LOC counts are present (comma-formatted)
+        assert "LOC" in out
+        # No issues added (informational only)
+        assert issues == []
+
+    def test_does_not_crash_when_file_missing(self, monkeypatch):
+        from hermes_cli import doctor as doc_mod
+        # Temporarily point to a nonexistent file
+        monkeypatch.setattr(doc_mod, "_GOD_FILES", [("nonexistent.py", "Ghost")])
+        issues = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doc_mod._check_godfile_loc(issues)
+        out = buf.getvalue()
+        assert "file not found" in out
+
+
+class TestCoreToolsCount:
+    """_check_core_tools_count must report _HERMES_CORE_TOOLS count."""
+
+    def test_reports_count(self, capsys):
+        from hermes_cli import doctor as doc_mod
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doc_mod._check_core_tools_count()
+        out = buf.getvalue()
+        assert "core tools" in out
+        assert "_HERMES_CORE_TOOLS" in out
+
+    def test_does_not_crash_when_import_fails(self, monkeypatch):
+        import builtins
+        from hermes_cli import doctor as doc_mod
+        orig_import = builtins.__import__
+
+        def _fail_import(name, *args, **kwargs):
+            if name == "toolsets":
+                raise ImportError("forced")
+            return orig_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", _fail_import)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doc_mod._check_core_tools_count()
+        out = buf.getvalue()
+        assert "Could not read" in out

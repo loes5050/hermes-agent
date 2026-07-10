@@ -47,8 +47,12 @@ from tools.tool_result_storage import (
     enforce_turn_budget,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
+from agent.otel_emitter import get_emitter as _get_otel_emitter
 
 logger = logging.getLogger(__name__)
+
+# Lazily resolved OTel emitter singleton (no-op when disabled or package absent).
+_otel = _get_otel_emitter()
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -540,6 +544,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 agent.tool_progress_callback("tool.started", name, preview, display_args)
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
+        try:
+            _otel.on_tool_start(name, args, getattr(tc, "id", "") or "")
+        except Exception:
+            pass
 
     for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
         if block_result is not None:
@@ -911,6 +919,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as cb_err:
                     logging.debug(f"Tool progress callback error: {cb_err}")
 
+            try:
+                _otel.on_tool_complete(
+                    function_name, duration=tool_duration, is_error=is_error,
+                    tool_call_id=getattr(tc, "id", "") or "",
+                )
+            except Exception:
+                pass
+
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
                 logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
@@ -1137,6 +1153,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent.tool_progress_callback("tool.started", function_name, preview, display_args)
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
+
+        if not _execution_blocked:
+            try:
+                _otel.on_tool_start(function_name, function_args, getattr(tool_call, "id", "") or "")
+            except Exception:
+                pass
 
         if not _execution_blocked and agent.tool_start_callback:
             try:
@@ -1589,6 +1611,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
+
+        if not _execution_blocked:
+            try:
+                _otel.on_tool_complete(
+                    function_name, duration=tool_duration,
+                    is_error=_is_error_result,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                )
+            except Exception:
+                pass
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")

@@ -3017,18 +3017,19 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         )
 
     @patch("tools.delegate_tool._load_config", return_value={})
-    def test_getter_defaults_to_deny(self, _mock_cfg):
+    def test_getter_defaults_to_tiered(self, _mock_cfg):
+        """Empty config defaults to tiered (safe t1-only), not YOLO deny-all."""
         from tools.delegate_tool import (
             _get_subagent_approval_callback,
-            _subagent_auto_deny,
+            _subagent_tiered_approve,
         )
-        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
+        self.assertIs(_get_subagent_approval_callback(), _subagent_tiered_approve)
 
     @patch(
         "tools.delegate_tool._load_config",
-        return_value={"subagent_auto_approve": False},
+        return_value={"subagent_approval_mode": "off", "subagent_auto_approve": False},
     )
-    def test_getter_explicit_false_is_deny(self, _mock_cfg):
+    def test_getter_explicit_off_is_deny(self, _mock_cfg):
         from tools.delegate_tool import (
             _get_subagent_approval_callback,
             _subagent_auto_deny,
@@ -3039,7 +3040,19 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         "tools.delegate_tool._load_config",
         return_value={"subagent_auto_approve": True},
     )
-    def test_getter_true_is_approve(self, _mock_cfg):
+    def test_getter_legacy_true_is_tiered_safe(self, _mock_cfg):
+        """Legacy true without mode → tiered t1 (not YOLO all)."""
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_tiered_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_tiered_approve)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_approval_mode": "all"},
+    )
+    def test_getter_mode_all_is_approve(self, _mock_cfg):
         from tools.delegate_tool import (
             _get_subagent_approval_callback,
             _subagent_auto_approve,
@@ -3048,10 +3061,13 @@ class TestSubagentApprovalCallback(unittest.TestCase):
 
     @patch(
         "tools.delegate_tool._load_config",
-        return_value={"subagent_auto_approve": "yes"},
+        return_value={
+            "subagent_auto_approve": True,
+            "subagent_auto_approve_legacy_all": True,
+        },
     )
-    def test_getter_truthy_string_is_approve(self, _mock_cfg):
-        """is_truthy_value accepts 'yes'/'1'/'true' as truthy."""
+    def test_getter_legacy_all_opt_in_is_approve(self, _mock_cfg):
+        """Explicit legacy_all restores YOLO approve-all."""
         from tools.delegate_tool import (
             _get_subagent_approval_callback,
             _subagent_auto_approve,
@@ -3088,6 +3104,259 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertEqual(seen, [_subagent_auto_deny])
         # Parent's callback slot is still empty (TLS isolates threads).
         self.assertIsNone(_get_approval_callback())
+
+
+class TestSubagentApprovalTiers(unittest.TestCase):
+    """Tests for the tiered subagent approval system.
+
+    classify_subagent_command_tier maps commands to tiers:
+      Tier 1 (read-only/safe)  → auto-approve
+      Tier 2 (network/install/push) → deny in subagent
+      Tier 3 (destructive)     → always deny
+
+    _subagent_tiered_approve uses the classifier and returns:
+      "once" for tier-1, "deny" for tier-2 and tier-3.
+
+    _get_subagent_approval_callback respects subagent_approval_mode config:
+      "tiered" (default) → _subagent_tiered_approve
+      "off"             → _subagent_auto_deny
+      "all"             → _subagent_auto_approve
+      Legacy subagent_auto_approve=true → tiered with deprecation warning
+        (unless subagent_auto_approve_legacy_all=true → approve-all)
+    """
+
+    # --- classify_subagent_command_tier ---
+
+    def test_tier1_read_only_commands(self):
+        """Read-only commands classify as tier-1."""
+        from tools.delegate_tool import classify_subagent_command_tier, _SUBAGENT_TIER_1
+        for cmd in [
+            "ls -la",
+            "cat README.md",
+            "head -20 file.py",
+            "tail -50 log.txt",
+            "git status",
+            "git log --oneline",
+            "git diff",
+            "pytest -q tests/",
+            "python -m pytest tests/",
+            "hermes doctor",
+            "hermes status",
+            "rg 'pattern' src/",
+            "grep -r 'todo' .",
+            "find . -name '*.py'",
+            "pwd",
+            "whoami",
+            "uname -a",
+        ]:
+            self.assertEqual(
+                classify_subagent_command_tier(cmd),
+                _SUBAGENT_TIER_1,
+                f"Expected tier-1 for: {cmd}",
+            )
+
+    def test_tier2_network_install_push(self):
+        """Network/install/push commands classify as tier-2."""
+        from tools.delegate_tool import classify_subagent_command_tier, _SUBAGENT_TIER_2
+        for cmd in [
+            "curl https://example.com/api",
+            "wget http://example.com/file",
+            "pip install requests",
+            "npm install lodash",
+            "git push origin main",
+            "git pull origin main",
+            "docker build -t myapp .",
+            "ssh user@host 'ls'",
+            "scp file.txt user@host:/path",
+        ]:
+            self.assertEqual(
+                classify_subagent_command_tier(cmd),
+                _SUBAGENT_TIER_2,
+                f"Expected tier-2 for: {cmd}",
+            )
+
+    def test_tier3_destructive_commands(self):
+        """Destructive commands classify as tier-3."""
+        from tools.delegate_tool import classify_subagent_command_tier, _SUBAGENT_TIER_3
+        for cmd in [
+            "rm -rf /",
+            "rm -rf /home",
+            "rm -rf ~",
+            "rm -rf $HOME",
+            "mkfs.ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda bs=1M",
+            "echo data > .env",
+            "echo secret >> .env",
+            "tee .env",
+        ]:
+            self.assertEqual(
+                classify_subagent_command_tier(cmd),
+                _SUBAGENT_TIER_3,
+                f"Expected tier-3 for: {cmd}",
+            )
+
+    def test_tier3_takes_precedence_over_tier1(self):
+        """A command containing both safe and destructive parts is tier-3."""
+        from tools.delegate_tool import classify_subagent_command_tier, _SUBAGENT_TIER_3
+        # Even though it contains 'ls' (tier-1), the 'rm -rf /' makes it tier-3
+        cmd = "rm -rf / && ls"
+        self.assertEqual(
+            classify_subagent_command_tier(cmd),
+            _SUBAGENT_TIER_3,
+        )
+
+    def test_empty_command_is_tier2(self):
+        """Empty/blank commands default to conservative tier-2."""
+        from tools.delegate_tool import classify_subagent_command_tier, _SUBAGENT_TIER_2
+        for cmd in ["", "   ", None]:
+            self.assertEqual(
+                classify_subagent_command_tier(cmd),
+                _SUBAGENT_TIER_2,
+            )
+
+    # --- _subagent_tiered_approve ---
+
+    def test_tiered_approve_tier1_returns_once(self):
+        from tools.delegate_tool import _subagent_tiered_approve
+        self.assertEqual(
+            _subagent_tiered_approve("ls -la", "dangerous"),
+            "once",
+        )
+
+    def test_tiered_approve_tier2_returns_deny(self):
+        from tools.delegate_tool import _subagent_tiered_approve
+        self.assertEqual(
+            _subagent_tiered_approve("curl https://example.com", "dangerous"),
+            "deny",
+        )
+
+    def test_tiered_approve_tier3_returns_deny(self):
+        from tools.delegate_tool import _subagent_tiered_approve
+        self.assertEqual(
+            _subagent_tiered_approve("rm -rf /", "dangerous"),
+            "deny",
+        )
+
+    # --- _get_subagent_approval_callback ---
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    def test_getter_defaults_to_tiered(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_tiered_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_tiered_approve)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_approval_mode": "tiered"},
+    )
+    def test_getter_explicit_tiered(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_tiered_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_tiered_approve)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_approval_mode": "off"},
+    )
+    def test_getter_explicit_off(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_auto_deny,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_approval_mode": "all"},
+    )
+    def test_getter_explicit_all(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_auto_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_approval_mode": "TIERED"},
+    )
+    def test_getter_mode_case_insensitive(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_tiered_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_tiered_approve)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_approval_mode": "bogus"},
+    )
+    def test_getter_unknown_mode_falls_back_to_tiered(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_tiered_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_tiered_approve)
+
+    # --- Legacy backward compatibility ---
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_auto_approve": True},
+    )
+    def test_legacy_true_defaults_to_tiered_t1(self, _mock_cfg):
+        """Legacy subagent_auto_approve=true without mode → tiered (SAFE)."""
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_tiered_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_tiered_approve)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "subagent_auto_approve": True,
+            "subagent_auto_approve_legacy_all": True,
+        },
+    )
+    def test_legacy_true_with_legacy_all_is_approve(self, _mock_cfg):
+        """Legacy true + legacy_all=true → YOLO approve-all (compat)."""
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_auto_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_approve)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "subagent_auto_approve": True,
+            "subagent_approval_mode": "off",
+        },
+    )
+    def test_explicit_mode_overrides_legacy(self, _mock_cfg):
+        """Explicit subagent_approval_mode takes precedence over legacy flag."""
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_auto_deny,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_auto_deny)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"subagent_auto_approve": False},
+    )
+    def test_legacy_false_defaults_to_tiered(self, _mock_cfg):
+        """Legacy false without mode → tiered (new default)."""
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_tiered_approve,
+        )
+        self.assertIs(_get_subagent_approval_callback(), _subagent_tiered_approve)
 
 
 class TestFallbackModelInheritance(unittest.TestCase):

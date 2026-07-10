@@ -1104,7 +1104,23 @@ DEFAULT_CONFIG = {
         # (Telegram, Discord, etc.) where the verification narrative would reach
         # a human as chat noise. Doc/markdown/skill-only edits never fire it.
         # Set true to force on everywhere, or false to disable.
+        # NOTE: the migration v30→v31 switches existing installs to ``false``
+        # (OFF) once, so the *effective* default on shipped installs is OFF.
+        # Set ``"gate"`` to enable the stronger verifier-gate (bounded re-entry
+        # until passing evidence exists) — this is opt-in and never the default.
+        # The default is always safe: ``false``/``"auto"``, never ``"gate"``.
         "verify_on_stop": "auto",
+        # Verifier gate settings — only consulted when verify_on_stop == "gate".
+        # The gate re-enters the conversation loop after a text response when
+        # edited paths lack fresh passing verification evidence. Bounded by
+        # max_attempts; after exhaustion it degrades to the advisory nudge
+        # above. All OFF by default — no cost unless "gate" is explicitly set.
+        "verify_gate": {
+            "max_attempts": 3,           # bounded re-entry before degrade-to-nudge
+            "require_canonical": True,   # only gate when canonical verify commands exist
+            "allow_ad_hoc": True,        # also accept ad-hoc temp-script evidence
+            "messaging_surface": False,  # gate even on messaging surfaces (default off)
+        },
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
@@ -2255,12 +2271,34 @@ DEFAULT_CONFIG = {
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,
-        # subagent threads ALWAYS resolve approvals non-interactively:
-        #   false (default) → auto-deny with a logger.warning audit line (safe)
-        #   true             → auto-approve "once" with a logger.warning audit line
-        # Flip to true only if you trust delegated work to run dangerous cmds
-        # without human review (cron pipelines, batch automation, etc.).
+        # subagent threads ALWAYS resolve approvals non-interactively.
+        #
+        # Tiered approval mode (default, recommended):
+        #   subagent_approval_mode controls the resolution strategy:
+        #     "tiered" (default) → tier-based: tier-1 read-only/safe commands
+        #                          auto-approve, tier-2 network/install/push
+        #                          deny, tier-3 destructive always deny.
+        #     "off"              → auto-deny everything (safest).
+        #     "all"              → auto-approve everything (YOLO, dangerous).
+        #
+        # Tier-1 (auto-approved): read-only commands (ls, cat, git status,
+        #   pytest, hermes doctor, etc.) — no side effects, safe to run.
+        # Tier-2 (denied): network/install/push commands (curl, pip install,
+        #   git push, etc.) — require interactive approval which subagents
+        #   cannot provide; denied for safety.
+        # Tier-3 (always denied): destructive commands (rm -rf /, mkfs, dd
+        #   to block device, raw .env writes) — never auto-approved.
+        "subagent_approval_mode": "tiered",
+        # Legacy binary flag (deprecated — prefer subagent_approval_mode):
+        #   false (default) → resolved by subagent_approval_mode
+        #   true            → logs deprecation warning; defaults to tiered
+        #                     tier-1 only for safety. To get old YOLO-all
+        #                     behaviour, set subagent_approval_mode: "all" or
+        #                     subagent_auto_approve_legacy_all: true.
         "subagent_auto_approve": False,
+        # Escape hatch for users who need the old approve-all behaviour:
+        # when subagent_auto_approve=true AND this is true, use YOLO all.
+        "subagent_auto_approve_legacy_all": False,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -2353,6 +2391,34 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+
+        # ── Skills index ranking (eager-index + lazy-body model) ──────────
+        # The system prompt keeps a compact NAME + DESCRIPTION index of every
+        # skill (bodies load lazily via skill_view only — full SKILL.md content
+        # is never injected into the system prompt).  When the skill library
+        # is large (hundreds of skills), the index block itself becomes a
+        # meaningful token cost on every API call.  These two settings cap
+        # that cost without losing recall: the index is ranked and only the
+        # top_k entries keep their full name+description line; the rest are
+        # still discoverable via skills_list / skill_view (the model just
+        # sees fewer descriptions up-front).
+        #
+        # index_top_k:  0 = include ALL skills (legacy behaviour, full index).
+        #               N > 0 = keep the top N ranked skills with full
+        #               name+description entries; skills ranked below N are
+        #               omitted from the system-prompt index entirely (they
+        #               remain fully loadable via skill_view / skills_list).
+        #               Default 120 — a measured improvement over the full
+        #               ~509-skill index for large installs, while keeping
+        #               every commonly-needed skill visible up-front.
+        # index_max_chars: 0 = no cap.  N > 0 = truncate the rendered index
+        #               block to at most N characters (a hard ceiling on the
+        #               token cost of the skills index).  Applied AFTER
+        #               top_k ranking, so the cap bites the lowest-ranked
+        #               survivors first.  Default 0 (off) — top_k is the
+        #               primary lever.
+        "index_top_k": 120,
+        "index_max_chars": 0,
     },
 
     # Curator — background skill maintenance.
@@ -3302,8 +3368,25 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # ── OpenTelemetry GenAI emitter (Phase 1, default OFF) ──────────
+    # Opt-in OTel foundation for the ``otel_then_langfuse`` observability
+    # plan.  When ``enabled: true`` and the ``opentelemetry`` packages are
+    # installed, the agent emits GenAI-style spans for tool start/complete.
+    # No network traffic unless an exporter is explicitly configured.
+    # Install: pip install opentelemetry-sdk
+    #          pip install opentelemetry-exporter-otlp  (for exporter: otlp)
+    "observability": {
+        "otel": {
+            "enabled": False,
+            "service_name": "hermes-agent",
+            "exporter": "none",  # none | console | otlp
+            "otlp_endpoint": "",  # OTLP gRPC/HTTP endpoint when exporter=otlp
+            "sample_rate": 1.0,  # 0.0–1.0, future use
+        },
+    },
+
     # Config schema version - bump this when adding new required fields
-    "_config_version": 33,
+    "_config_version": 34,
 }
 
 # =============================================================================

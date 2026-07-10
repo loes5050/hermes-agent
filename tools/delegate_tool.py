@@ -19,6 +19,7 @@ never the child's intermediate tool calls or reasoning.
 import enum
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -98,18 +99,321 @@ def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
     return "once"
 
 
+# ---------------------------------------------------------------------------
+# Subagent approval tiers
+# ---------------------------------------------------------------------------
+# Replaces the binary subagent_auto_approve YOLO flag with a tiered model:
+#
+#   Tier 1 (read-only / safe): read tools and safe commands. Auto-approved.
+#   Tier 2 (network/install/push): require interactive approval when
+#          available; if no interactive path exists (subagent worker thread),
+#          deny. Never auto-approved in subagent context.
+#   Tier 3 (destructive): always deny. No override (rm -rf /, mkfs, dd to
+#          block device, format, raw .env writes).
+#
+# The tier is determined by classifying the command that triggered the
+# dangerous-command approval prompt.  The approval callback receives the
+# command string and the description from detect_dangerous_command(), so we
+# can classify at approval-prompt time without re-running detection.
+#
+# Config (delegation section):
+#   subagent_approval_mode: "off" | "all" | "tiered"  (default: "tiered")
+#     off    → auto-deny everything (equivalent to old subagent_auto_approve=false)
+#     all    → auto-approve everything (old subagent_auto_approve=true, with
+#              deprecation warning)
+#     tiered → tier-based auto-approval (tier-1 only auto-approved)
+#
+#   subagent_auto_tiers: ["read_only"]  (default; list of tier names to
+#     auto-approve. Currently only "read_only" / tier-1 is meaningful.)
+#
+# Backward compatibility:
+#   If the legacy ``subagent_auto_approve`` key is set to a truthy value AND
+#   ``subagent_approval_mode`` is not explicitly set, we log a deprecation
+#   warning and default to SAFE behaviour: tiered with tier-1 only. To get
+#   the old YOLO-all behaviour, set ``subagent_approval_mode: all`` or
+#   ``subagent_auto_approve_legacy_all: true``.
+
+# Tier constants
+_SUBAGENT_TIER_1 = 1  # read-only / safe — auto-approve
+_SUBAGENT_TIER_2 = 2  # network / install / push — deny in subagent
+_SUBAGENT_TIER_3 = 3  # destructive — always deny
+
+# Tier-1 safe command patterns: read-only commands and safe build/test
+# commands that have no side effects outside the project tree. These are
+# matched against the command that triggered the dangerous-command
+# approval prompt (after normalization by the detection layer).
+#
+# The patterns are intentionally conservative — only commands that are
+# genuinely safe to run without human review in a subagent context.
+# Network commands (curl, wget, pip install, npm install, git push) and
+# destructive commands (rm -rf, mkfs, dd) are NOT here.
+_TIER1_SAFE_PATTERNS = [
+    # Read-only file inspection
+    r'\bcat\b',
+    r'\bhead\b',
+    r'\btail\b',
+    r'\bls\b',
+    r'\bless\b',
+    r'\bmore\b',
+    r'\bwc\b',
+    r'\bfile\b(?=\s)',  # 'file' command only (not /file in a URL)
+    r'\bstat\b',
+    r'\bdu\b',
+    r'\bdf\b',
+    r'\bfind\b',
+    r'\btree\b',
+    r'\bwhich\b',
+    r'\bwhereis\b',
+    r'\btype\b',
+    r'\benv\b(?!\s*\w+=)',  # env without VAR=VAL (bare env = print env)
+    r'\bprintenv\b',
+    r'\buname\b',
+    r'\bwhoami\b',
+    r'\bid\b',
+    r'\bhostname\b',
+    r'\bpwd\b',
+    r'\bdate\b',
+    r'\buptime\b',
+    # Read-only text search (rg, grep without -r write, ack)
+    r'\brg\b',
+    r'\bgrep\b',
+    r'\bag\b',
+    # Git read-only
+    r'\bgit\s+(status|log|diff|show|branch|remote|rev-parse|ls-files|blame|describe)\b',
+    # Python read-only / safe test
+    r'\bpython\d?\s+(-m\s+pytest|.*pytest)\b',
+    r'\bpytest\b',
+    r'\bpython\d?\s+-c\b',
+    r'\bpip\s+(show|list|freeze)\b',
+    r'\bpip3?\s+(-V|--version)\b',
+    # Node read-only
+    r'\bnpm\s+(list|ls|outdated|view|info)\b',
+    r'\bnpx\b(?!\s+\S*install)',
+    # Hermes doctor / config read
+    r'\bhermes\s+(doctor|config|status)\b',
+    # Make/dotnet build targets (non-destructive build/test)
+    r'\bmake\b(?!\s+clean)',
+    r'\bdotnet\s+(build|test)\b',
+    r'\bcargo\s+(build|test|check)\b',
+    r'\bgo\s+(build|test|vet)\b',
+]
+
+# Tier-2 network/install/push patterns: commands that require network access
+# or have side effects beyond the local project tree. These are checked BEFORE
+# tier-1 so that e.g. ``ssh user@host 'ls'`` is classified as tier-2 (network)
+# even though it contains ``ls`` (tier-1). Likewise ``pip install`` is tier-2
+# even though ``pip show`` is tier-1.
+_TIER2_NETWORK_PATTERNS = [
+    r'\bcurl\b',
+    r'\bwget\b',
+    r'\bscp\b',
+    r'\bssh\b',
+    r'\brsync\b',
+    r'\bftp\b',
+    r'\bsftp\b',
+    r'\btelnet\b',
+    r'\bnc\b',
+    r'\bnetcat\b',
+    r'\bgit\s+(push|pull|fetch|clone|remote\s+add)\b',
+    r'\bpip3?\s+install\b',
+    r'\bpip3?\s+download\b',
+    r'\bnpm\s+install\b',
+    r'\bnpm\s+publish\b',
+    r'\bnpx\s+create\b',
+    r'\byarn\s+(add|install|publish)\b',
+    r'\bdocker\s+(build|push|pull|run|exec)\b',
+    r'\bdocker-compose\s+(up|down|push|pull)\b',
+    r'\bkubectl\s+(apply|delete|create|exec|run)\b',
+    r'\bhelm\s+(install|upgrade|uninstall|delete)\b',
+    r'\bmake\s+install\b',
+    r'\bmake\s+deploy\b',
+    r'\bsudo\b',
+    r'\bapt(-get)?\s+install\b',
+    r'\bbrew\s+install\b',
+    r'\bdnf\s+install\b',
+    r'\byum\s+install\b',
+    r'\bpacman\s+-S\b',
+]
+
+_TIER2_COMPILED = [(re.compile(p, re.IGNORECASE), p) for p in _TIER2_NETWORK_PATTERNS]
+
+# Tier-3 destructive patterns (always deny, no override). These overlap with
+# the hardline patterns in approval.py but are checked here too so that even
+# in "all" mode (legacy YOLO) we refuse catastrophically destructive commands.
+_TIER3_DESTRUCTIVE_PATTERNS = [
+    r'\brm\s+-rf?\s+/',           # rm -rf /...
+    r'\brm\s+-rf?\s+~',           # rm -rf ~...
+    r'\brm\s+-rf?\s+\$HOME',
+    r'\bmkfs\b',
+    r'\bdd\b.*\bof=/dev/',
+    r'>\s*/dev/(sd|nvme)',
+    r'\bformat\b',
+    # Raw .env writes (tee, >, >>, cp to .env)
+    r'>\s*\.env\b',
+    r'>>\s*\.env\b',
+    r'\btee\b.*\.env\b',
+    r'\bcp\b.*\s\.env\b',
+]
+
+# Tier-2 network / install / push — checked BEFORE tier-1 so e.g.
+# ``wget http://example.com/file`` is never auto-approved just because
+# a safe token like ``file`` / ``id`` appears in the URL path.
+_TIER2_NETWORK_INSTALL_PATTERNS = [
+    r'\bcurl\b',
+    r'\bwget\b',
+    r'\bhttp(?:s)?://',
+    r'\bpip3?\s+install\b',
+    r'\bnpm\s+install\b',
+    r'\byarn\s+add\b',
+    r'\bpnpm\s+add\b',
+    r'\bgit\s+push\b',
+    r'\bgit\s+fetch\b',
+    r'\bgit\s+pull\b',
+    r'\bsudo\b',
+    r'\bapt(-get)?\s+install\b',
+    r'\bbrew\s+install\b',
+    r'\bchoco\s+install\b',
+    r'\bInvoke-WebRequest\b',
+    r'\birm\b',
+    r'\bssh\b',
+    r'\bscp\b',
+    r'\brsync\b',
+    r'\bdocker\b',
+    r'\bkubectl\b',
+]
+
+_TIER1_COMPILED = [(re.compile(p, re.IGNORECASE), p) for p in _TIER1_SAFE_PATTERNS]
+_TIER2_COMPILED = [(re.compile(p, re.IGNORECASE), p) for p in _TIER2_NETWORK_INSTALL_PATTERNS]
+_TIER3_COMPILED = [(re.compile(p, re.IGNORECASE), p) for p in _TIER3_DESTRUCTIVE_PATTERNS]
+
+
+def classify_subagent_command_tier(command: str) -> int:
+    """Classify a command into an approval tier for subagent context.
+
+    Returns one of:
+        _SUBAGENT_TIER_1  — read-only / safe (auto-approve)
+        _SUBAGENT_TIER_2  — network / install / push (deny in subagent)
+        _SUBAGENT_TIER_3  — destructive (always deny)
+
+    The command is the raw command string that triggered the dangerous-
+    command approval prompt.  We classify by pattern matching on the
+    normalized command.
+
+    Order: tier-3 → tier-2 (network/install) → tier-1 → default tier-2.
+    Destructive and network commands must never fall through to tier-1
+    via incidental token matches (e.g. ``file`` inside a URL path).
+    """
+    if not command or not command.strip():
+        return _SUBAGENT_TIER_2  # unknown → conservative
+
+    # Check tier-3 (destructive) first — always deny
+    for pattern_re, _ in _TIER3_COMPILED:
+        if pattern_re.search(command):
+            return _SUBAGENT_TIER_3
+
+    # Network / install / push before any tier-1 token match
+    for pattern_re, _ in _TIER2_COMPILED:
+        if pattern_re.search(command):
+            return _SUBAGENT_TIER_2
+
+    # Check tier-1 (safe read-only)
+    for pattern_re, _ in _TIER1_COMPILED:
+        if pattern_re.search(command):
+            return _SUBAGENT_TIER_1
+
+    # Everything else → tier-2 (requires approval, deny in subagent)
+    return _SUBAGENT_TIER_2
+
+
+def _subagent_tiered_approve(command: str, description: str, **kwargs) -> str:
+    """Tiered auto-approval callback for subagent worker threads.
+
+    Tier-1 (read-only / safe): auto-approve "once".
+    Tier-2 (network / install / push): deny (no interactive path in
+        subagent worker thread).
+    Tier-3 (destructive): always deny.
+
+    Logs a warning for every decision for audit trail.
+    """
+    tier = classify_subagent_command_tier(command)
+    if tier == _SUBAGENT_TIER_1:
+        logger.warning(
+            "Subagent tier-1 auto-approved (read-only/safe): %s (%s)",
+            command, description,
+        )
+        return "once"
+    elif tier == _SUBAGENT_TIER_3:
+        logger.warning(
+            "Subagent tier-3 denied (destructive, always deny): %s (%s)",
+            command, description,
+        )
+        return "deny"
+    else:
+        logger.warning(
+            "Subagent tier-2 denied (network/install/push, "
+            "no interactive path in subagent): %s (%s)",
+            command, description,
+        )
+        return "deny"
+
+
 def _get_subagent_approval_callback():
     """Return the callback to install into subagent worker threads.
 
-    Config key: delegation.subagent_auto_approve (bool, default False).
+    Config keys (delegation section):
+      subagent_approval_mode: "off" | "all" | "tiered" (default: "tiered")
+      subagent_auto_approve: bool (legacy; if true, logs deprecation
+        warning and maps to tiered tier-1 only for safety, unless
+        subagent_auto_approve_legacy_all is also true)
+
     Reads via the same _load_config() path as the rest of delegate_task so
     priority is config.yaml > (no env override for this knob) > default.
     """
     cfg = _load_config()
-    val = cfg.get("subagent_auto_approve", False)
-    if is_truthy_value(val):
-        return _subagent_auto_approve
-    return _subagent_auto_deny
+    mode = cfg.get("subagent_approval_mode")
+    legacy_auto = cfg.get("subagent_auto_approve", False)
+    legacy_all = cfg.get("subagent_auto_approve_legacy_all", False)
+
+    # Explicit mode wins
+    if mode is not None:
+        mode_str = str(mode).strip().lower()
+        if mode_str == "all":
+            return _subagent_auto_approve
+        elif mode_str == "off":
+            return _subagent_auto_deny
+        elif mode_str == "tiered":
+            return _subagent_tiered_approve
+        else:
+            logger.warning(
+                "Unknown subagent_approval_mode %r, falling back to tiered",
+                mode,
+            )
+            return _subagent_tiered_approve
+
+    # No explicit mode — check legacy flag
+    if is_truthy_value(legacy_auto):
+        if is_truthy_value(legacy_all):
+            # Explicit opt-in to old YOLO-all behaviour
+            logger.warning(
+                "subagent_auto_approve=true with "
+                "subagent_auto_approve_legacy_all=true — "
+                "using YOLO approve-all (legacy compat). "
+                "Prefer subagent_approval_mode: all for clarity."
+            )
+            return _subagent_auto_approve
+        else:
+            # SAFE default: legacy true → tiered tier-1 only
+            logger.warning(
+                "subagent_auto_approve=true is deprecated. "
+                "Defaulting to tiered mode (tier-1 read-only auto-approve "
+                "only) for safety. To get the old approve-all behaviour, "
+                "set subagent_approval_mode: all or "
+                "subagent_auto_approve_legacy_all: true."
+            )
+            return _subagent_tiered_approve
+
+    # Default: tiered
+    return _subagent_tiered_approve
 
 # NOTE: nested delegation is granted by role='orchestrator' (which re-adds the
 # "delegation" toolset in _build_child_agent), NOT by the model naming toolsets
@@ -2352,10 +2656,13 @@ def _recover_tasks_from_json_string(
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
+    toolsets: Optional[List[str]] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    acp_command: Optional[str] = None,
+    acp_args: Optional[List[str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2456,7 +2763,9 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2492,26 +2801,35 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            task_acp_args = t.get("acp_args") if "acp_args" in t else None
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            try:
+                task_creds = _resolve_per_task_credentials(t, creds, parent_agent)
+            except ValueError as exc:
+                return tool_error(str(exc))
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
                 context=t.get("context"),
-                # Subagents always inherit the parent's toolsets; the model
-                # cannot choose or narrow them (no model-facing toolsets arg).
-                toolsets=None,
-                model=creds["model"],
+                toolsets=t.get("toolsets") or toolsets,
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_acp_command=t.get("acp_command")
+                or acp_command
+                or task_creds.get("command"),
+                override_acp_args=(
+                    task_acp_args
+                    if task_acp_args is not None
+                    else (acp_args if acp_args is not None else task_creds.get("args"))
+                ),
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -3005,6 +3323,79 @@ def _resolve_child_credential_pool(
     return None
 
 
+def _parse_task_model_override(task: dict) -> tuple[Optional[str], Optional[str]]:
+    """Return (provider, model) from a per-task ``model`` field, if any.
+
+    Accepts either a string (model id only, provider from delegation defaults)
+    or an object ``{provider, model}`` for full routing.
+    """
+    raw = task.get("model")
+    if raw is None:
+        return None, None
+    if isinstance(raw, str):
+        m = raw.strip()
+        return (None, m) if m else (None, None)
+    if isinstance(raw, dict):
+        prov = str(raw.get("provider") or "").strip() or None
+        mod = str(raw.get("model") or "").strip() or None
+        return prov, mod
+    return None, None
+
+
+def _resolve_per_task_credentials(
+    task: dict,
+    default_creds: dict,
+    parent_agent,
+) -> dict:
+    """Merge per-task model overrides onto delegation defaults."""
+    prov_override, model_override = _parse_task_model_override(task)
+    if not prov_override and not model_override:
+        return dict(default_creds)
+
+    base_provider = prov_override or default_creds.get("provider")
+    base_model = model_override or default_creds.get("model")
+
+    if not base_provider:
+        # Model-only override on inherited parent provider
+        out = dict(default_creds)
+        if model_override:
+            out["model"] = model_override
+        return out
+
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested=base_provider, target_model=base_model
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve per-task delegation provider '{base_provider}' "
+            f"(model={base_model!r}): {exc}"
+        ) from exc
+
+    api_key = runtime.get("api_key", "")
+    if not api_key:
+        raise ValueError(
+            f"Per-task provider '{base_provider}' resolved but has no API key."
+        )
+
+    configured_provider = (
+        base_provider
+        if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+        else runtime.get("provider")
+    )
+    return {
+        "model": base_model or runtime.get("model") or None,
+        "provider": configured_provider,
+        "base_url": runtime.get("base_url"),
+        "api_key": api_key,
+        "api_mode": runtime.get("api_mode"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+    }
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
@@ -3270,7 +3661,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Subagent model can be selected per call via tasks[].model. String = model id (uses delegation.provider); object = {provider, model}. If omitted, children inherit delegation.provider/model from config.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3399,6 +3790,25 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "description": (
+                                "Per-task provider/model override. String = model id "
+                                "(uses delegation.provider). Object = "
+                                "{provider, model} e.g. "
+                                '{"provider":"xai-oauth","model":"grok-composer-2.5-fast"}.'
+                            ),
+                            "oneOf": [
+                                {"type": "string"},
+                                {
+                                    "type": "object",
+                                    "properties": {
+                                        "provider": {"type": "string"},
+                                        "model": {"type": "string"},
+                                    },
+                                    "required": ["model"],
+                                },
+                            ],
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3479,8 +3889,11 @@ registry.register(
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"),
         context=args.get("context"),
+        toolsets=args.get("toolsets"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
+        acp_command=args.get("acp_command"),
+        acp_args=args.get("acp_args"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),

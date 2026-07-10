@@ -24,8 +24,10 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_skills_index_settings,
     iter_skill_index_files,
     parse_frontmatter,
+    rank_skill_index,
     skill_matches_environment,
     skill_matches_platform,
     skill_matches_platform_list,
@@ -1446,6 +1448,8 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    *,
+    query: "str | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1466,6 +1470,19 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    Skills index ranking (``skills.index_top_k`` / ``skills.index_max_chars``
+    in config.yaml): when the skill library is large, the NAME + DESCRIPTION
+    index block itself becomes a token cost on every API call.  The index is
+    ranked — by keyword overlap with *query* (the recent user message) when
+    available, otherwise by usage telemetry (``.usage.json`` use_count /
+    view_count, then name) — and capped to the top *index_top_k* entries.
+    Skills ranked below the cap are OMITTED from the system-prompt index but
+    remain fully loadable via ``skill_view`` / ``skills_list`` (bodies are
+    never injected into the system prompt — lazy-body model).  When
+    ``index_top_k`` is 0, ALL skills are included (legacy behaviour).
+    ``index_max_chars`` (0 = off) applies a hard character ceiling on the
+    rendered index block, biting the lowest-ranked survivors first.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
@@ -1478,6 +1495,11 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    # index_top_k / index_max_chars are part of the cache key because they
+    # change the rendered output (ranking + truncation).  query is folded in
+    # too: a query-aware ranking produces a different index for the same
+    # skill set, so it must cache separately.
+    _idx_top_k, _idx_max_chars = get_skills_index_settings()
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1486,6 +1508,9 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        _idx_top_k,
+        _idx_max_chars,
+        query or "",
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1619,6 +1644,72 @@ def build_skills_system_prompt(
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
 
+    # ── Skills index ranking + top_k cap ─────────────────────────────────
+    # When the skill library is large (hundreds of skills), the NAME +
+    # DESCRIPTION index block becomes a meaningful token cost on every API
+    # call.  We rank the full skill set (by keyword overlap with the recent
+    # user message when available, otherwise by usage telemetry) and keep
+    # only the top ``skills.index_top_k`` entries in the rendered index.
+    # Skills ranked below the cap are NOT removed from the system — they
+    # remain fully loadable via ``skill_view`` / ``skills_list`` (bodies are
+    # never injected; this is a lazy-body model).  This keeps recall intact
+    # while measurably cutting the system-prompt token budget on large
+    # installs.
+    #
+    # Demoted (names-only) categories are excluded from ranking: their
+    # entries are already compressed to a single names line, so the per-skill
+    # token cost is negligible and ranking them would only remove names the
+    # model relies on for recall.
+    if _idx_top_k and _idx_top_k > 0 and skills_by_category:
+        _demoted_for_ranking = frozenset(
+            cat for cat in skills_by_category
+            if cat.split("/", 1)[0] in (compact_categories or frozenset())
+        )
+
+        # Flatten non-demoted skills for ranking.  Track (name, desc, cat)
+        # so we can re-group after capping.
+        _flat: list[tuple[str, str, str]] = []
+        _demoted_names: dict[str, set[str]] = {}
+        for _cat, _entries in skills_by_category.items():
+            if _cat in _demoted_for_ranking:
+                _demoted_names.setdefault(_cat, set())
+                for _n, _d in _entries:
+                    _demoted_names[_cat].add(_n)
+                continue
+            for _n, _d in _entries:
+                _flat.append((_n, _d, _cat))
+
+        # Only rank/cap when the flat list exceeds top_k — otherwise the
+        # index is small enough that ranking adds overhead for no benefit.
+        if len(_flat) > _idx_top_k:
+            # Load usage telemetry for the tiebreaker / no-query ranking.
+            _usage: dict[str, dict] = {}
+            try:
+                from tools.skill_usage import load_usage as _load_usage
+
+                _usage = _load_usage() or {}
+            except Exception:
+                _usage = {}
+
+            _ranked = rank_skill_index(
+                [(_n, _d) for _n, _d, _c in _flat],
+                query=query,
+                usage=_usage,
+                top_k=_idx_top_k,
+            )
+            _surviving = {(_n, _d) for _n, _d in _ranked}
+
+            # Rebuild skills_by_category keeping only survivors.  Demoted
+            # categories are preserved untouched.
+            _new_by_cat: dict[str, list[tuple[str, str]]] = {}
+            for _n, _d, _c in _flat:
+                if (_n, _d) in _surviving:
+                    _new_by_cat.setdefault(_c, []).append((_n, _d))
+            for _cat, _names in _demoted_names.items():
+                if _cat in skills_by_category:
+                    _new_by_cat[_cat] = list(skills_by_category[_cat])
+            skills_by_category = _new_by_cat
+
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
     # line — descriptions are dropped to cut noise, but every skill name
@@ -1666,6 +1757,37 @@ def build_skills_system_prompt(
                 else:
                     index_lines.append(f"    - {name}")
 
+        # ── index_max_chars cap ─────────────────────────────────────────
+        # Hard character ceiling on the rendered <available_skills> block.
+        # Applied AFTER top_k ranking (which already removed the lowest-
+        # ranked skills), so this only bites when top_k is 0 / very large
+        # or the surviving descriptions are unusually long.  We truncate
+        # whole lines from the END (lowest-priority, since index_lines is
+        # category-sorted, not rank-sorted — but the top_k pass already
+        # kept only the top entries, so any further cut is a coarse safety
+        # valve rather than a precision ranking tool).  A truncation note
+        # is appended so the model knows more skills exist via skills_list.
+        _index_body = "\n".join(index_lines)
+        if _idx_max_chars and _idx_max_chars > 0 and len(_index_body) > _idx_max_chars:
+            # Walk backwards dropping whole lines until we fit + leave room
+            # for the truncation note.
+            _note = (
+                "\n  …(index truncated: more skills available via "
+                "skills_list / skill_view)"
+            )
+            _budget = _idx_max_chars - len(_note)
+            if _budget < 0:
+                _budget = 0
+            _kept: list[str] = []
+            _used = 0
+            for _line in index_lines:
+                _need = len(_line) + (1 if _kept else 0)
+                if _used + _need > _budget:
+                    break
+                _kept.append(_line)
+                _used += _need
+            _index_body = "\n".join(_kept) + _note
+
         result = (
             "## Skills (mandatory)\n"
             "Before replying, scan the skills below. If a skill matches or is even partially relevant "
@@ -1689,7 +1811,7 @@ def build_skills_system_prompt(
             "pitfalls you discovered, update it before finishing.\n"
             "\n"
             "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
+            + _index_body + "\n"
             "</available_skills>\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."

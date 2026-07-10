@@ -827,3 +827,169 @@ def is_valid_namespace(candidate: Optional[str]) -> bool:
     if not candidate:
         return False
     return bool(_NAMESPACE_RE.match(candidate))
+
+
+# ===========================================================================
+# Skills index ranking — eager-index + lazy-body + top_k
+# ===========================================================================
+#
+# The system prompt injects a compact NAME + DESCRIPTION index of every skill
+# (bodies load lazily via ``skill_view`` — full SKILL.md content is never
+# injected into the system prompt).  When the skill library is large (hundreds
+# of skills), the index block itself becomes a meaningful token cost on every
+# API call.  ``rank_skill_index`` orders skills so a ``top_k`` cap can keep the
+# most likely-useful entries up-front without losing recall (dropped entries
+# remain fully loadable via ``skill_view`` / ``skills_list``).
+#
+# Ranking v1 — two-tier:
+#   1) If a *query* (the recent user message) is available at build time, rank
+#      by keyword overlap of the query against the skill's name + description
+#      (case-insensitive word intersection, ties broken by usage telemetry
+#      then name).
+#   2) If no query is available (system-prompt build happens before any user
+#      message on a fresh conversation, or on a cold start), rank by usage
+#      telemetry from ``.usage.json`` — ``use_count`` descending, then
+#      ``view_count`` descending, then name ascending.
+#
+# The function is PURE: it takes explicit inputs and returns a sorted list.
+# It performs no I/O of its own (the caller supplies the usage map).  This
+# makes it trivial to unit-test without touching the filesystem.
+
+# Stopwords excluded from the query's keyword set so that common words don't
+# dominate the overlap score.  Kept small and lowercase-only on purpose.
+_SKILL_RANK_STOPWORDS = frozenset(
+    {
+        "a", "an", "the", "and", "or", "but", "not", "is", "are", "was", "were",
+        "be", "been", "being", "have", "has", "had", "do", "does", "did", "to",
+        "of", "in", "on", "at", "by", "for", "with", "about", "as", "from",
+        "this", "that", "these", "those", "it", "its", "i", "you", "we", "they",
+        "my", "your", "our", "their", "me", "him", "her", "them", "can", "could",
+        "should", "would", "will", "just", "please", "help", "need", "want",
+        "how", "what", "when", "where", "why", "who", "which", "if", "then",
+        "so", "than", "too", "very", "up", "down", "out", "into", "over",
+    }
+)
+
+_WORD_RE = re.compile(r"[a-z0-9][a-z0-9._-]*[a-z0-9]|[a-z0-9]", re.IGNORECASE)
+
+
+def _tokenize(text: str) -> Set[str]:
+    """Split *text* into a lowercase keyword set, dropping stopwords.
+
+    Hyphens, underscores, and dots are treated as token separators so that
+    ``python-debug`` and ``python_debug`` both yield ``{python, debug}``.
+    """
+    if not text:
+        return set()
+    tokens: Set[str] = set()
+    for raw in _WORD_RE.findall(text.lower()):
+        for piece in re.split(r"[-_.]+", raw):
+            piece = piece.strip()
+            if not piece or piece in _SKILL_RANK_STOPWORDS:
+                continue
+            tokens.add(piece)
+    return tokens
+
+
+def rank_skill_index(
+    skills: List[Tuple[str, str]],
+    *,
+    query: Optional[str] = None,
+    usage: Optional[Dict[str, Dict[str, Any]]] = None,
+    top_k: int = 0,
+) -> List[Tuple[str, str]]:
+    """Rank skill ``(name, description)`` entries and optionally cap to *top_k*.
+
+    Pure function — no I/O.  Callers supply the usage telemetry map so the
+    ranker is deterministic and testable in isolation.
+
+    Args:
+        skills: Flat list of ``(name, description)`` tuples (any category —
+            the caller flattens categories before ranking).  Order is not
+            meaningful; the output is re-sorted by the ranking key.
+        query: Optional recent user message.  When supplied (non-empty after
+            stripping), the primary sort key is keyword-overlap score of
+            the query against ``name + description``.  When *None* or empty,
+            ranking falls back to usage telemetry then name.
+        usage: Optional ``.usage.json`` map — ``{skill_name: {use_count,
+            view_count, ...}}``.  Used both as a tiebreaker for query-based
+            ranking and as the primary key when no query is available.
+            Missing skills / missing keys are treated as zero usage.
+        top_k: Maximum number of entries to return.  ``0`` (default) returns
+            ALL entries, fully sorted — i.e. the ranking is computed but no
+            cap is applied (useful when the caller wants a ranked-but-full
+            index).  ``N > 0`` returns the top *N* entries.
+
+    Returns:
+        A new list of ``(name, description)`` tuples, sorted by the ranking
+        key and (if *top_k* > 0) truncated to at most *top_k* entries.  The
+        input list is never mutated.
+    """
+    if not skills:
+        return []
+
+    usage = usage or {}
+    query_tokens = _tokenize(query) if query else set()
+    has_query = bool(query_tokens)
+
+    def _usage_counts(name: str) -> Tuple[int, int]:
+        rec = usage.get(name)
+        if not isinstance(rec, dict):
+            return (0, 0)
+        return (
+            int(rec.get("use_count") or 0),
+            int(rec.get("view_count") or 0),
+        )
+
+    def _sort_key(item: Tuple[str, str]) -> Tuple[Any, ...]:
+        name, desc = item
+        use_count, view_count = _usage_counts(name)
+        if has_query:
+            name_tokens = _tokenize(name)
+            desc_tokens = _tokenize(desc)
+            skill_tokens = name_tokens | desc_tokens
+            # Primary: overlap count (desc).  Name matches are weighted x3
+            # so a skill whose NAME shares a query word ranks above one that
+            # merely mentions the word in its description.
+            name_overlap = len(name_tokens & query_tokens)
+            desc_overlap = len((skill_tokens - name_tokens) & query_tokens)
+            score = name_overlap * 3 + desc_overlap
+            # Tiebreakers: usage (use desc, view desc) then name asc.
+            return (-score, -use_count, -view_count, name.lower())
+        # No query: usage telemetry first, then name.
+        return (-use_count, -view_count, name.lower())
+
+    ranked = sorted(skills, key=_sort_key)
+
+    if top_k and top_k > 0:
+        return ranked[:top_k]
+    return ranked
+
+
+def get_skills_index_settings() -> Tuple[int, int]:
+    """Read ``skills.index_top_k`` and ``skills.index_max_chars`` from config.
+
+    Returns ``(index_top_k, index_max_chars)``.  Both default to the values
+    in ``DEFAULT_CONFIG`` when the keys are absent or not integers.  Reads
+    config.yaml directly via the shared mtime+size cache (no CLI config
+    import) to keep the prompt-build path lightweight.
+
+    ``index_top_k``: 0 = all skills (no cap); N > 0 = keep top N.
+    ``index_max_chars``: 0 = no cap; N > 0 = hard char ceiling on the index.
+    """
+    parsed = _load_raw_config()
+    skills_cfg = parsed.get("skills") if parsed else None
+    if not isinstance(skills_cfg, dict):
+        # Fall back to defaults when the section is absent.
+        return (120, 0)
+
+    def _int(key: str, default: int) -> int:
+        val = skills_cfg.get(key)  # type: ignore[union-attr]
+        if val is None:
+            return default
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
+    return (_int("index_top_k", 120), _int("index_max_chars", 0))

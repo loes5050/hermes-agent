@@ -5137,6 +5137,56 @@ def run_conversation(
                 ):
                     messages.pop()
 
+                # ── Verifier gate (opt-in via agent.verify_on_stop == "gate") ──
+                # When gate mode is active, try the bounded re-entry gate *first*.
+                # The gate re-enters the loop when edited paths lack fresh passing
+                # evidence, degrading to the advisory nudge below after max_attempts.
+                # When gate mode is OFF (the default) this block is a no-op and the
+                # existing verification_stop path below runs unchanged — no extra
+                # cost. The gate uses the same synthetic-user continuation seam so
+                # prompt caching and role alternation are preserved. (#verifier_gate)
+                _gate_nudge = None
+                if getattr(agent, "_verification_gate_active", None) is None:
+                    # Resolve once per session + cache — posture is fixed and we
+                    # must not re-evaluate config (which can touch the filesystem)
+                    # on every turn. Mirrors the _resolved_is_coding pattern below.
+                    try:
+                        from agent.verifier_gate import gate_mode_active
+
+                        agent._verification_gate_active = gate_mode_active()
+                    except Exception:
+                        agent._verification_gate_active = False
+                if agent._verification_gate_active:
+                    try:
+                        from agent.verifier_gate import gate_continuation
+
+                        _gate_nudge = gate_continuation(
+                            session_id=getattr(agent, "session_id", None),
+                            changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),
+                            attempts=getattr(agent, "_verification_gate_attempts", 0),
+                        )
+                    except Exception:
+                        logger.debug("verifier gate check failed", exc_info=True)
+                        _gate_nudge = None
+
+                if _gate_nudge:
+                    agent._verification_gate_attempts = (
+                        getattr(agent, "_verification_gate_attempts", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "verification_gate"
+                    final_msg["_verification_gate_synthetic"] = True
+                    messages.append(final_msg)
+                    messages.append({
+                        "role": "user",
+                        "content": _gate_nudge,
+                        "_verification_gate_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.debug("verifier gate re-entry (attempt %d)",
+                                 agent._verification_gate_attempts)
+                    continue
+
+                # ── Verification stop nudge (default path, unchanged) ──
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,

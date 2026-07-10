@@ -1642,6 +1642,276 @@ class TestParallelToolCallGuidance:
 
 
 # =========================================================================
+# Skills index ranking — rank_skill_index pure function
+# =========================================================================
+
+
+class TestRankSkillIndex:
+    """Pure-function tests for agent.skill_utils.rank_skill_index.
+
+    The ranker takes explicit inputs (no I/O) so every test is deterministic
+    and filesystem-free.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _import_ranker(self):
+        from agent.skill_utils import rank_skill_index
+
+        self.rank = rank_skill_index
+
+    def test_empty_input_returns_empty(self):
+        assert self.rank([]) == []
+
+    def test_no_query_no_usage_sorts_by_name_asc(self):
+        """With no query and no usage, ties break by name ascending."""
+        skills = [("zebra", "d"), ("alpha", "d"), ("mango", "d")]
+        out = self.rank(skills)
+        names = [n for n, _ in out]
+        assert names == ["alpha", "mango", "zebra"]
+
+    def test_no_query_ranks_by_usage_then_view(self):
+        """No query → sort by use_count desc, then view_count desc, then name."""
+        skills = [
+            ("low", "desc"),
+            ("high-use", "desc"),
+            ("mid", "desc"),
+        ]
+        usage = {
+            "high-use": {"use_count": 10, "view_count": 5},
+            "mid": {"use_count": 3, "view_count": 20},
+            "low": {"use_count": 0, "view_count": 1},
+        }
+        out = self.rank(skills, usage=usage)
+        names = [n for n, _ in out]
+        # use_count dominates: high-use (10) > mid (3) > low (0)
+        assert names == ["high-use", "mid", "low"]
+
+    def test_no_query_usage_tiebreaks_view_count(self):
+        """Equal use_count → view_count desc breaks the tie."""
+        skills = [("a", "d"), ("b", "d"), ("c", "d")]
+        usage = {
+            "a": {"use_count": 5, "view_count": 2},
+            "b": {"use_count": 5, "view_count": 8},
+            "c": {"use_count": 5, "view_count": 5},
+        }
+        out = self.rank(skills, usage=usage)
+        assert [n for n, _ in out] == ["b", "c", "a"]
+
+    def test_query_ranks_by_keyword_overlap(self):
+        """A query keyword present in a skill's name boosts it to the top."""
+        skills = [
+            ("python-debug", "Debug Python scripts"),
+            ("web-search", "Search the web"),
+            ("email-sender", "Send emails"),
+        ]
+        out = self.rank(skills, query="debug my python script")
+        # python-debug has both "python" and "debug" in its name → top
+        assert out[0][0] == "python-debug"
+
+    def test_query_name_match_weighted_above_description_match(self):
+        """Name overlap (x3) outranks description-only overlap (x1)."""
+        skills = [
+            # "python" in description only → score 1*1 = 1 (desc overlap)
+            ("web-search", "Search python docs"),
+            # "python" in name → score 1*3 = 3
+            ("python-tools", "General tools"),
+            # "python" in both name + desc → name 3 + desc 1 = 4
+            ("python-debug", "Debug python code"),
+        ]
+        out = self.rank(skills, query="python")
+        names = [n for n, _ in out]
+        # python-debug (4) > python-tools (3) > web-search (1)
+        assert names == ["python-debug", "python-tools", "web-search"]
+
+    def test_query_strips_stopwords(self):
+        """Common stopwords don't contribute to the overlap score."""
+        skills = [
+            ("the", "The quick brown fox"),  # name is a stopword
+            ("fox-hunter", "Hunt foxes"),
+        ]
+        out = self.rank(skills, query="the fox")
+        # "the" is a stopword → only "fox" counts.  fox-hunter has "fox" in
+        # name (score 3); "the" has no non-stopword tokens in name (score 0)
+        # but "fox" is in its description? No — desc is "The quick brown fox"
+        # → tokens {quick, brown, fox}.  So "the" skill has desc overlap = 1.
+        # fox-hunter: name "fox" overlap = 3.  fox-hunter wins.
+        assert out[0][0] == "fox-hunter"
+
+    def test_query_empty_string_falls_back_to_usage(self):
+        """An empty/whitespace query is treated as no query."""
+        skills = [("a", "d"), ("b", "d")]
+        usage = {"b": {"use_count": 5, "view_count": 0}, "a": {"use_count": 0, "view_count": 0}}
+        out = self.rank(skills, query="   ", usage=usage)
+        assert [n for n, _ in out] == ["b", "a"]
+
+    def test_top_k_caps_output(self):
+        """top_k > 0 returns at most that many entries."""
+        skills = [(f"skill-{i}", f"desc {i}") for i in range(50)]
+        out = self.rank(skills, top_k=10)
+        assert len(out) == 10
+
+    def test_top_k_zero_returns_all(self):
+        """top_k=0 (default) returns ALL entries, fully sorted."""
+        skills = [("c", "d"), ("a", "d"), ("b", "d")]
+        out = self.rank(skills, top_k=0)
+        assert len(out) == 3
+        assert [n for n, _ in out] == ["a", "b", "c"]
+
+    def test_top_k_larger_than_input_returns_all(self):
+        skills = [("a", "d"), ("b", "d")]
+        out = self.rank(skills, top_k=100)
+        assert len(out) == 2
+
+    def test_does_not_mutate_input(self):
+        """The input list is never mutated."""
+        skills = [("b", "d"), ("a", "d")]
+        original = list(skills)
+        self.rank(skills)
+        assert skills == original
+
+    def test_missing_usage_entry_treated_as_zero(self):
+        """Skills absent from the usage map get zero counts, not errors."""
+        skills = [("used", "d"), ("unused", "d")]
+        usage = {"used": {"use_count": 5, "view_count": 1}}
+        out = self.rank(skills, usage=usage)
+        assert out[0][0] == "used"
+        assert out[1][0] == "unused"
+
+    def test_non_dict_usage_value_handled_gracefully(self):
+        """A corrupt usage entry (non-dict) doesn't crash the ranker."""
+        skills = [("a", "d"), ("b", "d")]
+        usage = {"a": "not a dict", "b": {"use_count": 1, "view_count": 0}}
+        out = self.rank(skills, usage=usage)
+        # b has usage, a has corrupt entry → treated as zero → b first
+        assert out[0][0] == "b"
+
+    def test_query_with_non_alnum_tokens(self):
+        """Punctuation in the query doesn't crash tokenization."""
+        skills = [("python-debug", "Debug"), ("other", "stuff")]
+        out = self.rank(skills, query="python!!! debug???")
+        assert out[0][0] == "python-debug"
+
+    def test_hyphen_underscore_dot_normalized_in_name(self):
+        """python-debug, python_debug, and python.debug all tokenize to {python, debug}."""
+        skills = [
+            ("python-debug", "desc"),
+            ("python_debug", "desc"),
+            ("python.debug", "desc"),
+        ]
+        # Query "python" → all three have "python" in name (score 3 each),
+        # tiebreak by name asc: "python-debug" < "python.debug" < "python_debug"
+        out = self.rank(skills, query="python")
+        names = [n for n, _ in out]
+        assert names == ["python-debug", "python.debug", "python_debug"]
+
+
+# =========================================================================
+# Skills index top_k + index_max_chars integration in build_skills_system_prompt
+# =========================================================================
+
+
+class TestSkillsIndexTopKIntegration:
+    @pytest.fixture(autouse=True)
+    def _clear_skills_cache(self):
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        yield
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+
+    def _make_skills(self, tmp_path, count):
+        """Create *count* dummy skills under tmp_path/skills/."""
+        d = tmp_path / "skills" / "misc"
+        d.mkdir(parents=True)
+        for i in range(count):
+            sd = d / f"skill-{i:03d}"
+            sd.mkdir()
+            (sd / "SKILL.md").write_text(
+                f"---\nname: skill-{i:03d}\ndescription: Skill number {i} for testing\n---\n"
+            )
+
+    def test_top_k_caps_skills_in_prompt(self, monkeypatch, tmp_path):
+        """When index_top_k < total skills, only top_k appear in the prompt."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # No config.yaml → get_skills_index_settings returns default 120.
+        # Create 200 skills so the default 120 cap bites.
+        self._make_skills(tmp_path, 200)
+
+        # Patch the settings reader so we can set a small top_k for a fast test.
+        from unittest.mock import patch
+
+        with patch(
+            "agent.prompt_builder.get_skills_index_settings",
+            return_value=(5, 0),
+        ):
+            result = build_skills_system_prompt()
+
+        # Count how many "- skill-NNN:" lines appear
+        import re
+
+        skill_lines = re.findall(r"^\s*- skill-\d{3}:", result, re.MULTILINE)
+        assert len(skill_lines) == 5
+
+    def test_top_k_zero_keeps_all_skills(self, monkeypatch, tmp_path):
+        """index_top_k=0 (legacy) keeps every skill."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._make_skills(tmp_path, 10)
+
+        from unittest.mock import patch
+
+        with patch(
+            "agent.prompt_builder.get_skills_index_settings",
+            return_value=(0, 0),
+        ):
+            result = build_skills_system_prompt()
+
+        import re
+
+        skill_lines = re.findall(r"^\s*- skill-\d{3}:", result, re.MULTILINE)
+        assert len(skill_lines) == 10
+
+    def test_index_max_chars_truncates_block(self, monkeypatch, tmp_path):
+        """index_max_chars truncates the rendered index block."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._make_skills(tmp_path, 10)
+
+        from unittest.mock import patch
+
+        # top_k=0 (no cap) but a tiny max_chars → truncation should bite.
+        with patch(
+            "agent.prompt_builder.get_skills_index_settings",
+            return_value=(0, 200),
+        ):
+            result = build_skills_system_prompt()
+
+        # The truncation note must be present.
+        assert "index truncated" in result
+        # The available_skills block must be under 200 chars.
+        start = result.find("<available_skills>")
+        end = result.find("</available_skills>")
+        body = result[start + len("<available_skills>") : end].strip()
+        assert len(body) <= 200
+
+    def test_small_library_not_affected_by_top_k(self, monkeypatch, tmp_path):
+        """When total skills < top_k, ranking doesn't drop anything."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._make_skills(tmp_path, 3)
+
+        from unittest.mock import patch
+
+        with patch(
+            "agent.prompt_builder.get_skills_index_settings",
+            return_value=(120, 0),
+        ):
+            result = build_skills_system_prompt()
+
+        import re
+
+        skill_lines = re.findall(r"^\s*- skill-\d{3}:", result, re.MULTILINE)
+        assert len(skill_lines) == 3
+
+
+# =========================================================================
 # Budget warning history stripping
 # =========================================================================
 

@@ -32,4 +32,12 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
             "doctor` first to see active advisories and their IDs."
         ),
     )
+    doctor_parser.add_argument(
+        "--core-tools",
+        action="store_true",
+        help=(
+            "Also print the count of tools in toolsets._HERMES_CORE_TOOLS "
+            "(the model-tool schema footprint)."
+        ),
+    )
     doctor_parser.set_defaults(func=cmd_doctor)
